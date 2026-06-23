@@ -15,9 +15,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 NS3_DIR = "/home/shemuping/newCode/ns3-FRP/simulator/ns-3.39"
+DUMP_DIR = "/home/shemuping/newCode/ns3-FRP/dump" 
 RESULTS_DIR = "/home/shemuping/newCode/ns3-FRP/results"
 CONFIG_FILE = "examples/PowerTCP/config.txt"  # 使用config.txt而不是config-burst.txt
 DURATION = 0.020
+
+os.makedirs(DUMP_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def run_and_plot(ccMode, algo_name):
     """运行仿真并绘图"""
@@ -56,7 +60,7 @@ def run_and_plot(ccMode, algo_name):
     print("✓ 编译完成\n")
     
     # 3. 运行仿真
-    log_file = f"/tmp/algo_cc{ccMode}.log"
+    log_file = os.path.join(DUMP_DIR, f"algo_cc{ccMode}.log")
     print(f"运行仿真...")
     cmd = f"cd {NS3_DIR} && timeout 90 ./build/examples/PowerTCP/ns3.39-crossDC-evaluation-optimized --conf={CONFIG_FILE} --algorithm={ccMode} > {log_file} 2>&1"
     result = subprocess.run(cmd, shell=True, timeout=100)

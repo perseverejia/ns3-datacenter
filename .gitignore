@@ -85,3 +85,7 @@ simulator/bake/.lock*
 *.xml
 !simulator/ns-3.39/doc/
 !simulator/ns-3.39/src/*/examples/*.xml
+
+.github/
+docs/
+instructions.md
