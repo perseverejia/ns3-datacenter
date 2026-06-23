@@ -17,11 +17,15 @@ import numpy as np
 NS3_DIR = "/home/shemuping/newCode/ns3-FRP/simulator/ns-3.39"
 DUMP_DIR = "/home/shemuping/newCode/ns3-FRP/dump" 
 RESULTS_DIR = "/home/shemuping/newCode/ns3-FRP/results"
+FCT_DIR = os.path.join(RESULTS_DIR, "fct")
+PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
 CONFIG_FILE = "examples/PowerTCP/config.txt"  # 使用config.txt而不是config-burst.txt
 DURATION = 0.020
 
 os.makedirs(DUMP_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(FCT_DIR, exist_ok=True)
+os.makedirs(PFC_DIR, exist_ok=True)
 
 def run_and_plot(ccMode, algo_name):
     """运行仿真并绘图"""
@@ -48,6 +52,13 @@ def run_and_plot(ccMode, algo_name):
     # 设置正确的时间范围 (0到仿真结束)
     content = re.sub(r'QLEN_MON_START\s+\d+', 'QLEN_MON_START 0', content)
     content = re.sub(r'QLEN_MON_END\s+\d+', f'QLEN_MON_END {int(DURATION * 1e9)}', content)
+    
+    # 设置 FCT / PFC 输出文件路径（按算法命名，分别放到 results/fct 和 results/pfc）
+    fct_out = os.path.join(FCT_DIR, f"fct_{algo_name.lower()}.txt")
+    pfc_out = os.path.join(PFC_DIR, f"pfc_{algo_name.lower()}.txt")
+    content = re.sub(r'FCT_OUTPUT_FILE\s+\S+', f'FCT_OUTPUT_FILE {fct_out}', content)
+    content = re.sub(r'PFC_OUTPUT_FILE\s+\S+', f'PFC_OUTPUT_FILE {pfc_out}', content)
+
     
     with open(config_path, 'w') as f:
         f.write(content)
@@ -84,6 +95,7 @@ def run_and_plot(ccMode, algo_name):
         # DCQCN/HPCC/TIMELY 使用 DCQCN_QLEN，改为Switch 10
         if '[DCQCN_QLEN]' in l and ccMode in [1, 3, 7]:
             parts = l.split()
+            # 监控的是Switch 10的Port 1（连host 4的端口）
             if len(parts) >= 5 and int(parts[2]) == 10 and int(parts[3]) == 1:
                 sw10_time.append(float(parts[1]) / 1e9 * 1000)  # timestep -> ms
                 sw10_q.append(float(parts[4]) / 1024.0)  # Bytes -> KB
