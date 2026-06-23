@@ -14,8 +14,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-NS3_DIR = "/home/gj/ns3/simulator/ns-3.39"
-RESULTS_DIR = "/home/gj/ns3/results"
+NS3_DIR = "/home/shemuping/newCode/ns3-FRP/simulator/ns-3.39"
+RESULTS_DIR = "/home/shemuping/newCode/ns3-FRP/results"
 CONFIG_FILE = "examples/PowerTCP/config.txt"  # 使用config.txt而不是config-burst.txt
 DURATION = 0.020
 

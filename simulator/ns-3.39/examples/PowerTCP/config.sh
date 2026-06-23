@@ -1,1 +1,1 @@
-NS3=/home/vamsi/ns3-datacenter/simulator/ns-3.39
+NS3=/home/shemuping/newCode/ns3-FRP/simulator/ns-3.39
