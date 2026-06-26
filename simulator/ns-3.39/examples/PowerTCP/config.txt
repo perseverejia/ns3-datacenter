@@ -7,12 +7,12 @@ TOPOLOGY_FILE examples/PowerTCP/topology.txt
 FLOW_FILE examples/PowerTCP/flow.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
-FCT_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/fct/fct_rocc.txt
-PFC_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/pfc/pfc_rocc.txt
+FCT_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/fct/fct_hpcc.txt
+PFC_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/pfc/pfc_hpcc.txt
 
-SIMULATOR_STOP_TIME 0.020
+SIMULATOR_STOP_TIME 0.050
 
-CC_MODE 14
+CC_MODE 3
 ALPHA_RESUME_INTERVAL 1
 RATE_DECREASE_INTERVAL 4
 CLAMP_TARGET_RATE 0

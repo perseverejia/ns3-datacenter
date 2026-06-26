@@ -129,12 +129,35 @@ def run_and_plot(ccMode, algo_name):
                 host_rates[host].append(rate_gbps)
                 host_times[host].append(time_us / 1000.0)
     
+    # 解析接收侧 per-flow 速率 ([FLOW TP])
+    flow_tp = {}  # key=(src,dst,sport,dport) → {times:[], rates:[]}
+    for l in lines:
+        l = l.strip()
+        m = re.search(
+            r'\[FLOW TP\] Src (\d+) Dst (\d+) pg (\d+) sport (\d+) dport (\d+) '
+            r'throughput ([\d.e+\-]+) time ([\d.e+\-]+) m_recv_bytes (\d+)', l)
+        if m:
+            src = int(m.group(1))
+            dst = int(m.group(2))
+            sport = int(m.group(4))
+            dport = int(m.group(5))
+            tp_bps = float(m.group(6))
+            t_sec = float(m.group(7))
+            key = (src, dst, sport, dport)
+            if key not in flow_tp:
+                flow_tp[key] = {'times': [], 'rates': []}
+            flow_tp[key]['times'].append(t_sec * 1000)  # 转换为 ms
+            flow_tp[key]['rates'].append(tp_bps / 1e9)   # bps → Gbps
+    
     # 时间轴：按时间周期采样，直接使用日志中的真实时间戳，不再用 linspace 兜底
     active_hosts = sorted(host_rates.keys())
-    print(f"✓ 解析完成: Switch10 {len(sw10_time)} 点, 活跃主机 {len(active_hosts)} 个")
+    active_flows = sorted(flow_tp.keys())
+    print(f"✓ 解析完成: Switch10 {len(sw10_time)} 点, 活跃主机 {len(active_hosts)} 个, 接收侧流 {len(active_flows)} 条")
     print(f"  活跃主机列表: {active_hosts}")
     for h in active_hosts:
         print(f"    Host {h}: {len(host_rates[h])} 个速率数据点")
+    for fk in active_flows:
+        print(f"    Flow {fk}: {len(flow_tp[fk]['times'])} 个接收速率数据点")
     print()
     
     # 5. 绘图
@@ -142,16 +165,16 @@ def run_and_plot(ccMode, algo_name):
     plt.rcParams['font.family'] = 'DejaVu Sans'
     plt.rcParams['axes.unicode_minus'] = False
     
-    fig, axes = plt.subplots(2, 1, figsize=(18, 12), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(18, 16), sharex=True)
     fig.suptitle(f'{algo_name} (ccMode={ccMode}) - Burst Traffic Analysis',
                  fontsize=18, fontweight='bold')
     
     colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan', 'lime', 'brown', 'pink', 'gray',
               'magenta', 'olive', 'teal', 'navy', 'maroon', 'coral', 'gold', 'indigo']
     
-    # 子图1: 主机速率
+    # 子图1: 发送侧主机速率 (m_rate)
     ax1 = axes[0]
-    print(f"绘制 {len(active_hosts)} 个流的速率...")
+    print(f"绘制 {len(active_hosts)} 个流的发送速率...")
     for idx, h in enumerate(active_hosts[:15]):  # 最多显示15个流
         if host_rates[h]:
             c = colors[idx % len(colors)]
@@ -166,29 +189,52 @@ def run_and_plot(ccMode, algo_name):
                     color=c, lw=2, label=f'Flow {h}', alpha=0.85)
     
     ax1.set_ylabel('Sending Rate (Gbps)', fontsize=14, fontweight='bold')
-    ax1.set_title(f'Flow Sending Rates ({len(active_hosts)} flows)', fontsize=15, fontweight='bold')
+    ax1.set_title(f'TX Rate - CC m_rate ({len(active_hosts)} flows)', fontsize=15, fontweight='bold')
     ax1.legend(loc='upper right', fontsize=10, ncol=3, framealpha=0.9)
     ax1.grid(True, alpha=0.3, linestyle='--')
     ax1.set_ylim(0, 110)
     ax1.tick_params(labelsize=11)
     
-    # 子图2: 队列长度
+    # 子图2: 接收侧 per-flow Throughput ([FLOW TP])
     ax2 = axes[1]
-    if sw10_time and sw10_q:
-        ax2.fill_between(sw10_time, 0, sw10_q, alpha=0.35, color='purple')
-        ax2.plot(sw10_time, sw10_q, color='purple', lw=2, label='Switch 10 Port 1')
-        ax2.axhline(y=500, color='blue', ls='--', lw=2, alpha=0.7, label='qRef = 500KB')
-        ax2.axhline(y=300, color='red', ls=':', lw=1.5, alpha=0.6, label='q_th = 300KB')
+    print(f"绘制 {len(active_flows)} 条流的接收速率...")
+    for idx, fk in enumerate(active_flows[:15]):  # 最多显示15条流
+        times = flow_tp[fk]['times']
+        rates = flow_tp[fk]['rates']
+        n = min(len(rates), len(times))
+        times = times[:n]
+        rates = rates[:n]
+        if n == 0:
+            continue
+        c = colors[idx % len(colors)]
+        print(f"  Flow {fk}: {n} 点, 速率范围 [{min(rates):.2f}, {max(rates):.2f}] Gbps, 时间范围 [{min(times):.3f}, {max(times):.3f}] ms")
+        ax2.plot(times, rates,
+                 color=c, lw=2, label=f'Flow {fk[0]}->{fk[1]} (sp={fk[2]})', alpha=0.85)
     
-    ax2.set_ylabel('Queue Length (KB)', fontsize=14, fontweight='bold')
-    ax2.set_xlabel('Time (ms)', fontsize=14, fontweight='bold')
-    ax2.set_title('Switch 10 Queue Length (Port 1 - Bottleneck)', fontsize=15, fontweight='bold')
-    ax2.legend(loc='upper right', fontsize=11, framealpha=0.9)
+    ax2.set_ylabel('Receive Throughput (Gbps)', fontsize=14, fontweight='bold')
+    ax2.set_title(f'RX Throughput - per-flow ({len(active_flows)} flows)', fontsize=15, fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=10, ncol=3, framealpha=0.9)
     ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.set_ylim(0, 110)
+    ax2.tick_params(labelsize=11)
+    
+    # 子图3: 队列长度
+    ax3 = axes[2]
+    if sw10_time and sw10_q:
+        ax3.fill_between(sw10_time, 0, sw10_q, alpha=0.35, color='purple')
+        ax3.plot(sw10_time, sw10_q, color='purple', lw=2, label='Switch 10 Port 1')
+        ax3.axhline(y=500, color='blue', ls='--', lw=2, alpha=0.7, label='qRef = 500KB')
+        ax3.axhline(y=300, color='red', ls=':', lw=1.5, alpha=0.6, label='q_th = 300KB')
+    
+    ax3.set_ylabel('Queue Length (KB)', fontsize=14, fontweight='bold')
+    ax3.set_xlabel('Time (ms)', fontsize=14, fontweight='bold')
+    ax3.set_title('Switch 10 Queue Length (Port 1 - Bottleneck)', fontsize=15, fontweight='bold')
+    ax3.legend(loc='upper right', fontsize=11, framealpha=0.9)
+    ax3.grid(True, alpha=0.3, linestyle='--')
     
     max_q = max(sw10_q) if sw10_q else 1000
-    ax2.set_ylim(-50, max_q * 1.15)
-    ax2.tick_params(labelsize=11)
+    ax3.set_ylim(-50, max_q * 1.15)
+    ax3.tick_params(labelsize=11)
     
     plt.tight_layout()
     

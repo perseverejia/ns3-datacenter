@@ -145,20 +145,24 @@ struct FlowInput {
 	uint64_t src, dst, pg, maxPacketCount, port, dport;
 	double start_time;
 	uint32_t idx;
+	uint64_t last_recv_bytes;  // 上次采样时的 m_recv_bytes，用于计算 delta goodput
 };
 FlowInput flow_input = {0};
 uint32_t flow_num;
+std::vector<FlowInput> flows;                              // 保存所有流的完整信息（含实际分配的 sport）
 
 void ReadFlowInput() {
 	if (flow_input.idx < flow_num) {
 		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.dport >> flow_input.maxPacketCount >> flow_input.start_time;
 		std::cout << "Flow " << flow_input.src << " " << flow_input.dst << " " << flow_input.pg << " " << flow_input.dport << " " << flow_input.maxPacketCount << " " << flow_input.start_time << " " << Simulator::Now().GetSeconds() << std::endl;
 		NS_ASSERT(n.Get(flow_input.src)->GetNodeType() == 0 && n.Get(flow_input.dst)->GetNodeType() == 0);
+		flows.push_back(flow_input);  // 保存流记录（此时 port 尚未分配，由 ScheduleFlowInputs 回填）
 	}
 }
 void ScheduleFlowInputs() {
 	while (flow_input.idx < flow_num && Seconds(flow_input.start_time) <= Simulator::Now()) {
 		uint32_t port = portNumder[flow_input.src][flow_input.dst]++; // get a new port number
+		flows[flow_input.idx].port = port;  // 回填实际分配的 sport，供 PrintResultsFlow 查找 RxQp
 		RdmaClientHelper clientHelper(flow_input.pg, serverAddress[flow_input.src], serverAddress[flow_input.dst], port, flow_input.dport, flow_input.maxPacketCount, has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(flow_input.src)][n.Get(flow_input.dst)]) : 0, global_t == 1 ? maxRtt : pairRtt[flow_input.src][flow_input.dst], Simulator::GetMaximumSimulationTime());
 		ApplicationContainer appCon = clientHelper.Install(n.Get(flow_input.src));
 //		appCon.Start(Seconds(flow_input.start_time));
@@ -588,23 +592,45 @@ void PrintResults(std::map<uint32_t, NetDeviceContainer> ToR, uint32_t numToRs, 
 }
 
 
-void PrintResultsFlow(std::map<uint32_t, NetDeviceContainer> Src, uint32_t numFlows, double delay) {
-	for (uint32_t i = 0; i < numFlows; i++) {
-		double throughputTotal = 0;
+void PrintResultsFlow(double delay) {
+	for (auto &fi : flows) {
+		// 获取目标节点的 RdmaDriver
+		Ptr<Node> dstNode = n.Get(fi.dst);
+		Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
+		if (rdma == NULL || rdma->m_rdma == NULL) continue;
+		// 查找 RxQp（注意 GetRxQp 参数顺序错位，详见计划文档）
+		Ptr<RdmaRxQueuePair> rxQp = rdma->m_rdma->GetRxQp(
+			serverAddress[fi.dst].Get(),  // sip形参 ← 接收端IP
+			serverAddress[fi.src].Get(),  // dip形参 ← 发送端IP
+			fi.dport,                      // sport形参 ← 接收端dport
+			(uint16_t)fi.port,             // dport形参 ← 发送端sport
+			(uint16_t)fi.pg,
+			false);                        // 不创建，查不到就跳过
+		if (rxQp == NULL) continue;       // 流尚未开始或已结束
 
-		for (uint32_t j = 0; j < Src[i].GetN(); j++) {
-			Ptr<QbbNetDevice> nd = DynamicCast<QbbNetDevice>(Src[i].Get(j));
-//			uint64_t txBytes = nd->getTxBytes();
-			uint64_t txBytes = nd->getNumTxBytes();
+		// 计算 goodput（用结构体自带的 last_recv_bytes，无需 key/map，绝不碰撞）
+		uint64_t current = rxQp->m_recv_bytes;
+		uint64_t last = fi.last_recv_bytes;
+		fi.last_recv_bytes = current;
 
-			uint64_t qlen = nd->GetQueue()->GetNBytesTotal();
-			double throughput = double(txBytes * 8) / delay;
-			throughputTotal += throughput;
-			// std::cout << "Src " << i << " Port " << j << " throughput "<< throughput << " txBytes " << txBytes << " qlen " << qlen << " time " << Simulator::Now().GetSeconds() << std::endl;
-		}
-		std::cout << "Src " << i << " Total " << 0 << " throughput " << throughputTotal <<  " time " << Simulator::Now().GetSeconds() << std::endl;
+		// 首次采样：只记录基线，不输出（避免数据累积时间 ≠ delay 导致高估）
+		if (last == 0) continue;
+
+		double throughput = (current >= last) ?
+			double(current - last) * 8.0 / delay : 0.0;
+
+		// 输出
+		std::cout << "[FLOW TP] Src " << fi.src
+		          << " Dst " << fi.dst
+		          << " pg " << fi.pg
+		          << " sport " << fi.port
+		          << " dport " << fi.dport
+		          << " throughput " << throughput
+		          << " time " << Simulator::Now().GetSeconds()
+		          << " m_recv_bytes " << current
+		          << std::endl;
 	}
-	Simulator::Schedule(Seconds(delay), PrintResultsFlow, Src, numFlows, delay);
+	Simulator::Schedule(Seconds(delay), PrintResultsFlow, delay);
 }
 
 
@@ -1457,6 +1483,7 @@ int main(int argc, char *argv[])
 	double delay = 1.5 * minRtt * 1e-9; // 10 micro seconds
 	//由于输出在SwitchNotifyDequeue里，这里不用再使用printResults函数
 	//Simulator::Schedule(Seconds(delay), PrintResults, switchDown, 1, delay);
+	Simulator::Schedule(Seconds(delay), PrintResultsFlow, delay);
 
 
 	// AsciiTraceHelper ascii;

@@ -156,6 +156,7 @@ public:
 	int32_t m_milestone_rx;
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
+	uint64_t m_recv_bytes; // 累计按序接收的 payload 字节数（用于接收侧 goodput 统计）
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();

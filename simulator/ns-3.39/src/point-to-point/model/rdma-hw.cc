@@ -354,6 +354,12 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 	rxQp->m_milestone_rx = m_ack_interval;
 
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+	// 按序到达时累加接收字节（用于接收侧 goodput 统计）
+	// x==1: 按序+需发ACK; x==5: 按序+无需ACK
+	// x==2/x==4: 乱序(不累加,等重传补洞); x==3: 重复包(不累加)
+	if (x == 1 || x == 5) {
+		rxQp->m_recv_bytes += payload_size;
+	}
 	if (x == 1 || x == 2) { //generate ACK or NACK
 		qbbHeader seqh;
 		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
