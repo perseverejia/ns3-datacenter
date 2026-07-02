@@ -822,7 +822,8 @@ void AddWorkloadFlow(uint32_t src,
                      uint64_t flowSize,
                      double startTime,
                      long &flowCount,
-                     long &totalFlowSize)
+                     long &totalFlowSize,
+                     uint16_t forcedDport = 0)
 {
 	if (src == dst || flowSize == 0)
 		return;
@@ -840,7 +841,10 @@ void AddWorkloadFlow(uint32_t src,
 	}
 
 	uint16_t sport = portNumder[src][dst]++;
-	uint16_t dport = DestportNumder[src][dst]++;
+	uint16_t dport = forcedDport ? forcedDport : DestportNumder[src][dst]++;
+	if (forcedDport && DestportNumder[src][dst] <= dport) {
+		DestportNumder[src][dst] = dport + 1;
+	}
 
 	FlowInput fi = {0};
 	fi.src = src;
@@ -868,6 +872,52 @@ void AddWorkloadFlow(uint32_t src,
 
 	flowCount++;
 	totalFlowSize += flowSize;
+}
+
+void InstallFlowFileBackground(const std::string& flowFile,
+                               long& backgroundFlowCount,
+                               long& totalBackgroundFlowSize)
+{
+	std::ifstream bgFlow;
+	bgFlow.open(flowFile.c_str());
+	NS_ASSERT_MSG(bgFlow.is_open(), "Cannot open background flow file: " << flowFile);
+
+	uint32_t bgFlowNum = 0;
+	bgFlow >> bgFlowNum;
+	for (uint32_t i = 0; i < bgFlowNum; i++) {
+		uint32_t src = 0, dst = 0, pg = 0;
+		uint16_t dport = 0;
+		uint64_t flowSize = 0;
+		double startTime = 0;
+		bgFlow >> src >> dst >> pg >> dport >> flowSize >> startTime;
+		NS_ASSERT_MSG(bgFlow.good() || bgFlow.eof(), "Invalid background flow entry in " << flowFile);
+		NS_ASSERT_MSG(src < n.GetN() && dst < n.GetN(), "Background flow node id out of range");
+		NS_ASSERT_MSG(n.Get(src)->GetNodeType() == 0 && n.Get(dst)->GetNodeType() == 0,
+		              "Background flow selected a non-host node");
+		NS_ASSERT_MSG(src != dst, "Background flow src and dst must differ");
+		NS_ASSERT_MSG(flowSize > 0, "Background flow size must be positive");
+		NS_ASSERT_MSG(serverAddress[src].Get() != Ipv4Address("10.0.0.1").Get() &&
+		              serverAddress[dst].Get() != Ipv4Address("10.0.0.1").Get(),
+		              "Background flow uses temporary serverAddress");
+
+		AddWorkloadFlow(src, dst, pg, flowSize, startTime,
+		                backgroundFlowCount, totalBackgroundFlowSize, dport);
+		std::cout << "[BACKGROUND FLOW] src " << src
+		          << " dst " << dst
+		          << " pg " << pg
+		          << " dport " << dport
+		          << " size " << flowSize
+		          << " start " << startTime
+		          << std::endl;
+	}
+	bgFlow.close();
+
+	std::cout << "Total background flow: " << backgroundFlowCount << std::endl;
+	if (backgroundFlowCount > 0) {
+		std::cout << "Actual background average flow size: "
+		          << static_cast<double>(totalBackgroundFlowSize) / backgroundFlowCount
+		          << std::endl;
+	}
 }
 
 void InstallBackgroundWorkload(double load,
@@ -966,6 +1016,8 @@ int main(int argc, char *argv[])
 	double queryRequestRate = 0;
 	uint32_t incast = 5;
 	unsigned randomSeed = 7;
+	bool enableFlowFileBackground = false;
+	std::string backgroundFlowFile = "";
 
 	uint32_t algorithm = 3;
 	uint32_t windowCheck = 1;
@@ -992,9 +1044,41 @@ int main(int argc, char *argv[])
 	cmd.AddValue ("algorithm", "specify CC mode. This is added for my convinience. I prefer cmd rather than parsing files.", algorithm);
 	cmd.AddValue("windowCheck", "windowCheck", windowCheck);
 	cmd.AddValue("incast", "query fan-in", incast);
+	cmd.AddValue("enableFlowFileBackground", "Enable deterministic background flows from a flow file", enableFlowFileBackground);
+	cmd.AddValue("backgroundFlowFile", "Background flow file; empty means use FLOW_FILE from config", backgroundFlowFile);
 
 	cmd.Parse (argc, argv);
 	FAN = incast;
+
+	// 保存命令行值，用于配置文件解析后覆盖（-1 表示未显式传入）
+	double cmd_load = -1;
+	double cmd_START_TIME = -1;
+	double cmd_END_TIME = -1;
+	double cmd_FLOW_LAUNCH_END_TIME = -1;
+	double cmd_queryRequestRate = -1;
+	int64_t cmd_requestSize = -1;
+	int64_t cmd_incast = -1;
+	bool cmd_enableFlowFileBackground = false;
+	std::string cmd_backgroundFlowFile = "";
+	std::string cmd_cdfFileName = "";
+	{
+		// 通过对比默认值判断是否显式传入
+		double def_load = 0.2, def_START = 0.001, def_END = 0.05, def_FLE = 0.045, def_QRR = 0;
+		uint32_t def_req = 0, def_incast = 5;
+		bool def_effb = false;
+		std::string def_bff = "", def_cdf = "examples/PowerTCP/Alistorage.txt";
+		if (load != def_load)                   cmd_load = load;
+		if (START_TIME != def_START)            cmd_START_TIME = START_TIME;
+		if (END_TIME != def_END)                cmd_END_TIME = END_TIME;
+		if (FLOW_LAUNCH_END_TIME != def_FLE)     cmd_FLOW_LAUNCH_END_TIME = FLOW_LAUNCH_END_TIME;
+		if (queryRequestRate != def_QRR)        cmd_queryRequestRate = queryRequestRate;
+		if (requestSize != def_req)             cmd_requestSize = requestSize;
+		if (incast != def_incast)               cmd_incast = incast;
+		if (enableFlowFileBackground != def_effb) cmd_enableFlowFileBackground = enableFlowFileBackground;
+		if (backgroundFlowFile != def_bff)       cmd_backgroundFlowFile = backgroundFlowFile;
+		if (cdfFileName != def_cdf)              cmd_cdfFileName = cdfFileName;
+	}
+
 	if (LEAF_SERVER_CAPACITY > 0 && LEAF_SERVER_CAPACITY < LINK_CAPACITY_BASE)
 		LEAF_SERVER_CAPACITY *= LINK_CAPACITY_BASE;
 	if (SPINE_LEAF_CAPACITY > 0 && SPINE_LEAF_CAPACITY < LINK_CAPACITY_BASE)
@@ -1306,6 +1390,49 @@ int main(int argc, char *argv[])
 			std::cout << "NIC_DELAY\t\t\t\t" << nic_delay_ns << "ns (" 
 			          << (nic_delay_ns / 1000.0) << "μs)" << '\n';
 		}
+		// ===== workload 参数从配置文件读取 =====
+		else if (key.compare("CDF_FILE_NAME") == 0) {
+			conf >> cdfFileName;
+			std::cout << "CDF_FILE_NAME\t\t\t" << cdfFileName << '\n';
+		}
+		else if (key.compare("LOAD") == 0) {
+			conf >> load;
+			std::cout << "LOAD\t\t\t\t" << load << '\n';
+		}
+		else if (key.compare("START_TIME") == 0) {
+			conf >> START_TIME;
+			std::cout << "START_TIME\t\t\t" << START_TIME << '\n';
+		}
+		else if (key.compare("END_TIME") == 0) {
+			conf >> END_TIME;
+			std::cout << "END_TIME\t\t\t" << END_TIME << '\n';
+		}
+		else if (key.compare("FLOW_LAUNCH_END_TIME") == 0) {
+			conf >> FLOW_LAUNCH_END_TIME;
+			std::cout << "FLOW_LAUNCH_END_TIME\t\t" << FLOW_LAUNCH_END_TIME << '\n';
+		}
+		else if (key.compare("QUERY_REQUEST_RATE") == 0) {
+			conf >> queryRequestRate;
+			std::cout << "QUERY_REQUEST_RATE\t\t" << queryRequestRate << '\n';
+		}
+		else if (key.compare("REQUEST_SIZE") == 0) {
+			conf >> requestSize;
+			std::cout << "REQUEST_SIZE\t\t\t" << requestSize << '\n';
+		}
+		else if (key.compare("INCAST") == 0) {
+			conf >> incast;
+			std::cout << "INCAST\t\t\t\t" << incast << '\n';
+		}
+		else if (key.compare("ENABLE_FLOW_FILE_BACKGROUND") == 0) {
+			uint32_t v;
+			conf >> v;
+			enableFlowFileBackground = (v != 0);
+			std::cout << "ENABLE_FLOW_FILE_BACKGROUND\t" << (enableFlowFileBackground ? "Yes" : "No") << '\n';
+		}
+		else if (key.compare("BACKGROUND_FLOW_FILE") == 0) {
+			conf >> backgroundFlowFile;
+			std::cout << "BACKGROUND_FLOW_FILE\t\t" << backgroundFlowFile << '\n';
+		}
 		fflush(stdout);
 	}
 	conf.close();
@@ -1315,6 +1442,19 @@ int main(int argc, char *argv[])
 	has_win = windowCheck; // overrides configuration file
 	var_win = windowCheck; // overrides configuration file
 	simulator_stop_time = END_TIME;
+
+	// workload 参数：命令行覆盖配置文件（仅当命令行显式传入了非默认值时）
+	if (cmd_load >= 0)                load = cmd_load;
+	if (cmd_START_TIME >= 0)          START_TIME = cmd_START_TIME;
+	if (cmd_END_TIME >= 0)            END_TIME = cmd_END_TIME;
+	if (cmd_FLOW_LAUNCH_END_TIME >= 0) FLOW_LAUNCH_END_TIME = cmd_FLOW_LAUNCH_END_TIME;
+	if (cmd_queryRequestRate >= 0)    queryRequestRate = cmd_queryRequestRate;
+	if (cmd_requestSize >= 0)         requestSize = (uint32_t)cmd_requestSize;
+	if (cmd_incast >= 0)              incast = (uint32_t)cmd_incast;
+	if (cmd_enableFlowFileBackground) enableFlowFileBackground = true;
+	if (!cmd_backgroundFlowFile.empty()) backgroundFlowFile = cmd_backgroundFlowFile;
+	if (!cmd_cdfFileName.empty())     cdfFileName = cmd_cdfFileName;
+	FAN = incast;
 
 
 	Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
@@ -1808,6 +1948,13 @@ int main(int argc, char *argv[])
 
 	DiscoverWorkloadTopology(SERVER_COUNT, LEAF_COUNT, LEAF_SERVER_CAPACITY, SPINE_LEAF_CAPACITY, SPINE_COUNT);
 	InitializeWorkloadPorts();
+
+	long backgroundFlowCount = 0;
+	long totalBackgroundFlowSize = 0;
+	if (enableFlowFileBackground) {
+		std::string bgFile = backgroundFlowFile.empty() ? flow_file : backgroundFlowFile;
+		InstallFlowFileBackground(bgFile, backgroundFlowCount, totalBackgroundFlowSize);
+	}
 
 	NS_LOG_INFO("Initialize CDF table");
 	struct cdf_table* cdfTable = new cdf_table();

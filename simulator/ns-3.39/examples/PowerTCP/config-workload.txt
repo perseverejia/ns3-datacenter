@@ -7,10 +7,24 @@ TOPOLOGY_FILE examples/PowerTCP/topology.txt
 FLOW_FILE examples/PowerTCP/flow.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
-FCT_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/workload/fct/fct_workload.txt
-PFC_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/workload/pfc/pfc_workload.txt
+FCT_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/workload/fct/fct_frp_load0.2_bgflow.txt
+PFC_OUTPUT_FILE /home/shemuping/newCode/ns3-FRP/results/workload/pfc/pfc_frp_load0.2_bgflow.txt
 
 SIMULATOR_STOP_TIME 0.050
+
+# ===== workload 参数（可被命令行覆盖）=====
+CDF_FILE_NAME examples/PowerTCP/Alistorage.txt
+LOAD 0.2
+START_TIME 0.005
+END_TIME 0.05
+FLOW_LAUNCH_END_TIME 0.045
+QUERY_REQUEST_RATE 0
+REQUEST_SIZE 0
+INCAST 5
+
+# ===== 混合流量模式配置 =====
+ENABLE_FLOW_FILE_BACKGROUND 1
+BACKGROUND_FLOW_FILE examples/PowerTCP/flow-background.txt
 
 CC_MODE 13
 ALPHA_RESUME_INTERVAL 1
