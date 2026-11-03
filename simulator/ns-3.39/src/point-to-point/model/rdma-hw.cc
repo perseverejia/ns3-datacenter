@@ -872,7 +872,7 @@ void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
 	// Keep DCQCN queue logs and TX RATE logs on stdout.  Both use the same
 	// stdio stream, so each printf call is serialized instead of being
 	// interleaved after the runner redirects stdout and stderr to one file.
-	#if PRINT_LOG
+	#if TX_RATE_LOG
 	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps t %luns\n",
 	        m_node->GetId(),
 	        qp->sip.Get(), qp->dip.Get(),
@@ -899,6 +899,7 @@ void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate) {
 }
 
 #define PRINT_LOG 0
+#define TX_RATE_LOG 1  // [TX RATE] plot_tx_rate 依赖; 独立于 PRINT_LOG
 /******************************
  * Mellanox's version of DCQCN
  *****************************/
