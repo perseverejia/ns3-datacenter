@@ -45,6 +45,8 @@ CrossDC-Algos/
 | 13 | FRP | 交换机周期反馈 |
 | 14 | ROCC | FRP 变体 |
 | 15 | ATC | 基于 DCQCN 的 gateway 模式 |
+| 16 | DCIEXT | 接收方 DCI 交换机周期探测可用带宽（RTT 驱动，0xFA 反馈限速） |
+| 17 | EPFC | 接收方 excess 带宽反馈（CCF 设速 + 端口门控） |
 
 ## 使用方法
 
