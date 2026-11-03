@@ -84,7 +84,7 @@ def analyze_query_flow_fct(query_fct_file):
         print("\n  Cross-DC vs Intra-DC FCT Comparison:")
         print(f"    Cross-DC:  avg={np.mean(cross_fct):.3f} ms, min={np.min(cross_fct):.3f} ms, max={np.max(cross_fct):.3f} ms")
         print(f"    Intra-DC:  avg={np.mean(intra_fct):.3f} ms, min={np.min(intra_fct):.3f} ms, max={np.max(intra_fct):.3f} ms")
-        print("    Note: Cross-DC FCT has been compensated (subtracted long-distance RTT)")
+        print("    Note: FCT is raw (no compensation) for all flows")
 
     print(f"{'='*80}\n")
 
@@ -96,6 +96,7 @@ DUMP_DIR = os.path.join(REPO_ROOT, "dump/workload")
 RESULTS_DIR = os.path.join(REPO_ROOT, "results/workload")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
 PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
+TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
 ATC_ALGO_MODE = 15
 ATC_BASE_CC_MODE = 1
 
@@ -264,7 +265,18 @@ def run_and_plot(args):
         content = f.read()
 
     load = read_config_value(content, "LOAD", "default")
-    suffix = f"{args.algo_name.lower()}_load{load_tag(load)}"
+    
+    # 提取CDF名称（如 websearch, alistorage）
+    cdf_path = read_config_value(content, "CDF_FILE_NAME", "")
+    cdf_base = os.path.splitext(os.path.basename(cdf_path))[0].lower() if cdf_path else "unknown"
+    
+    # 格式化负载值（如 0.20）
+    try:
+        load_str = f"{float(load):.2f}"
+    except ValueError:
+        load_str = load
+    
+    suffix = f"{args.algo_name.lower()}_{cdf_base}_load{load_str}"
 
     fct_template = read_config_value(
         content,
@@ -463,8 +475,9 @@ def run_and_plot(args):
 
         ip_to_node = parse_ip_to_node_map(lines)
         tx_rates = parse_tx_rate(lines, ip_to_node, query_flow_keys)
+        os.makedirs(TXRATE_DIR, exist_ok=True)
         tx_rate_output_file = os.path.join(
-            RESULTS_DIR,
+            TXRATE_DIR,
             f"workload_txrate_{args.algo_name.lower()}_cc{args.ccMode}_load{load_tag(load)}.png",
         )
         if tx_rates:
@@ -511,6 +524,28 @@ def run_and_plot(args):
         print(f"Log: {log_file}")
         print(f"FCT: {fct_out}")
         print(f"PFC: {pfc_out}")
+        # PFC 触发统计
+        if os.path.exists(pfc_out) and os.path.getsize(pfc_out) > 0:
+            pfc_pause = 0
+            pfc_resume = 0
+            pfc_switches = {}
+            with open(pfc_out, 'r') as pf:
+                for line in pf:
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        ptype = int(parts[4])
+                        if ptype == 2:
+                            pfc_pause += 1
+                            sw_id = parts[1]
+                            pfc_switches[sw_id] = pfc_switches.get(sw_id, 0) + 1
+                        elif ptype == 3:
+                            pfc_resume += 1
+            print(f"PFC stats: PAUSE={pfc_pause}  RESUME={pfc_resume}")
+            if pfc_switches:
+                sw_detail = ", ".join([f"SW{k}({v})" for k, v in sorted(pfc_switches.items(), key=lambda x: -x[1])])
+                print(f"  PFC by switch: {sw_detail}")
+        else:
+            print(f"PFC stats: PAUSE=0  RESUME=0 (no events)")
         print(f"Image file: {output_file}")
         if tx_rates:
             print(f"TX RATE image file: {tx_rate_output_file}")

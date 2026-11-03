@@ -56,7 +56,7 @@ NS_LOG_COMPONENT_DEFINE("QbbNetDevice");
 
 namespace ns3 {
 
-uint32_t RdmaEgressQueue::ack_q_idx = 3;
+uint32_t RdmaEgressQueue::ack_q_idx = 0;  // ACK 使用 q=0（最高优先级），避免被 PFC 阻塞
 uint32_t RdmaEgressQueue::tcpip_q_idx = 1;
 // RdmaEgressQueue
 TypeId RdmaEgressQueue::GetTypeId (void)
@@ -257,8 +257,11 @@ QbbNetDevice::QbbNetDevice()
 	for (uint32_t i = 0; i < qCnt; i++) {
 		m_paused[i] = false;
 		dummy_paused[i] = false;
+		m_dciExtGated[i] = false;   // DCI-Ext: 默认不门控（惰性）
 		m_rdmaEQ->dummy_paused[i] = dummy_paused[i];
 	}
+	m_ignoreReceivedPfc = false;  // DCI-Ext: 默认不忽略 PFC
+	m_wanPort = false;           // 默认非长链路端口（workload 拓扑解析显式设置）
 	hostDequeueIndex = 0;
 }
 
@@ -386,7 +389,19 @@ QbbNetDevice::DequeueAndTransmit(void)
 		return;
 	}
 	else {  //switch, doesn't care about qcn, just send
-		p = m_queue->DequeueRR(m_paused);		//this is round-robin
+		// DCI-Ext (ccMode=16): 门控时把 m_dciExtGated 合入 paused 判定（副本数组，不改 PFC 状态）
+		bool anyDciGated = false;
+		for (uint32_t qi = 0; qi < qCnt; qi++) {
+			if (m_dciExtGated[qi]) { anyDciGated = true; break; }
+		}
+		if (anyDciGated) {
+			bool mergedPaused[qCnt];
+			for (uint32_t qi = 0; qi < qCnt; qi++)
+				mergedPaused[qi] = m_paused[qi] || m_dciExtGated[qi];
+			p = m_queue->DequeueRR(mergedPaused);		//this is round-robin
+		} else {
+			p = m_queue->DequeueRR(m_paused);		//this is round-robin
+		}
 		if (p != 0) {
 			m_snifferTrace(p);
 			m_promiscSnifferTrace(p);
@@ -405,6 +420,11 @@ QbbNetDevice::DequeueAndTransmit(void)
 				p->RemovePacketTag(t);
 			}
 			m_traceDequeue(p, qIndex);
+			// ePFC (ccMode=17)：实际出队挂点 —— S 计量在物理发送前最后时刻执行：
+			// 门控中被拦的包不出队、不经过此处（天然不计 S），
+			// XON 后倾泻的存量也如实计入，保证 S 口径 = 物理发出字节
+			if (!m_epfcDequeueCb.IsNull())
+				m_epfcDequeueCb(m_ifIndex, p);
 			TransmitStart(p);
 			numTxBytes += p->GetSize();
 			totalBytesSent += p->GetSize();
@@ -437,6 +457,21 @@ QbbNetDevice::Resume(unsigned qIndex)
 	NS_LOG_INFO("Node " << m_node->GetId() << " dev " << m_ifIndex << " queue " << qIndex <<
 	            " resumed at " << Simulator::Now().GetSeconds());
 	DequeueAndTransmit();
+}
+
+// ========== DCI-Ext (ccMode=16): 本地端口门控 ==========
+
+void
+QbbNetDevice::SetDciExtGate(uint32_t qIndex, bool on)
+{
+	m_dciExtGated[qIndex] = on;
+	if (!on) {
+		// 恢复时 kick 一次出队（门控期间 DequeueRR 返回空，txMachine 空转）。
+		// 必须用立即事件而非同步调用：ePFC 的出队挂点（DataDequeue→EvaluatePort
+		// →SendGate→本函数）会同步重入本函数，同步 kick 造成无限递归（v6.5 实测栈溢出）；
+		// 且重入会撕裂门控状态（内层 XOFF 与外层 XON 交错写 gated/gatedPgs）
+		Simulator::ScheduleNow(&QbbNetDevice::DequeueAndTransmit, this);
+	}
 }
 
 void
@@ -490,8 +525,10 @@ QbbNetDevice::Receive(Ptr<Packet> packet)
 // std::cout << "receive" << std::endl;
 	NS_LOG_FUNCTION(this << packet);
 	
-	// 1. 检查是否有网卡处理延迟
-	if (!m_nicDelay.IsZero() && !m_nicDelay.IsNegative()) {
+	// 1. 网卡处理延迟仅主机节点生效：交换机是硬件转发（cut-through/store-forward），
+	//    无协议栈处理延迟；NIC_DELAY 全局属性不再作用于交换机端口。
+	//    （否则每跳入口 +15us，RTT 地板 = 传播 + 15us×(2×跳数)，多跳放大失真）
+	if (m_node->GetNodeType() == 0 && !m_nicDelay.IsZero() && !m_nicDelay.IsNegative()) {
 		// 有延迟，调度延迟执行（不阻塞当前流程）
 		Simulator::Schedule(m_nicDelay, &QbbNetDevice::DoReceive, this, packet);
 		return;
@@ -538,13 +575,22 @@ QbbNetDevice::DoReceive(Ptr<Packet> packet)
 	}
 	if (ch.l3Prot == 0xFE) { // PFC
 		if (!m_qbbEnabled) return;
+		// DCI-Ext 长链路端口：忽略收到的 PFC，防止 ACK 回路被阻断导致死锁
+		if (m_ignoreReceivedPfc) {
+			printf("[PFC_IGNORED] %lu node=%u port=%u q=%u\n", Simulator::Now().GetTimeStep(), m_node->GetId(), m_ifIndex, ch.pfc.qIndex);
+			return;
+		}
 		unsigned qIndex = ch.pfc.qIndex;
 		if (ch.pfc.time > 0) {
 			m_tracePfc(1);
 			m_paused[qIndex] = true;
+			printf("[NIC_PFC_RX] %lu node=%u if=%u q=%u type=XOFF\n", 
+				Simulator::Now().GetTimeStep(), m_node->GetId(), m_ifIndex, qIndex);
 		} else {
 			m_tracePfc(0);
 			Resume(qIndex);
+			printf("[NIC_PFC_RX] %lu node=%u if=%u q=%u type=XON\n", 
+				Simulator::Now().GetTimeStep(), m_node->GetId(), m_ifIndex, qIndex);
 		}
 	} else { // non-PFC packets (data, ACK, NACK, CNP...)
 		if (m_node->GetNodeType() > 0) { // switch

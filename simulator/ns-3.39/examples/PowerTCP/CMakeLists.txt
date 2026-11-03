@@ -24,19 +24,20 @@ build_example(
     ${libinternet}
     ${libapplications}
 )
-build_example(
-  NAME crossDC-evaluation-workload
-  SOURCE_FILES
-    crossDC-evaluation-workload.cc
-    cdf.c
-  HEADER_FILES
-    cdf.h
-  LIBRARIES_TO_LINK
-    ${libpoint-to-point}
-    ${libtraffic-control}
-    ${libinternet}
-    ${libapplications}
-)
+# crossDC-evaluation-workload 已移至 CrossDC-Algos 目录，避免重复定义
+# build_example(
+#   NAME crossDC-evaluation-workload
+#   SOURCE_FILES
+#     crossDC-evaluation-workload.cc
+#     cdf.c
+#   HEADER_FILES
+#     cdf.h
+#   LIBRARIES_TO_LINK
+#     ${libpoint-to-point}
+#     ${libtraffic-control}
+#     ${libinternet}
+#     ${libapplications}
+# )
 build_example(
   NAME powertcp-evaluation-fairness
   SOURCE_FILES 

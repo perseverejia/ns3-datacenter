@@ -20,6 +20,11 @@
 #include "ns3/unsched-tag.h"
 #include "ns3/icmpv4.h"  // 添加ICMP FRP支持
 
+// DCQCN队列长度监控：指定交换机的出口队列长度
+// 通过配置文件 QLEN_MON_SWITCHES 指定监控的交换机 ID 列表
+// 如果列表为空，则监控所有交换机
+std::set<uint32_t> qlen_mon_switches;
+
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("SwitchNode");
@@ -83,6 +88,13 @@ TypeId SwitchNode::GetTypeId (void)
 	                                  TimeValue(MicroSeconds(100)),
 	                                  MakeTimeAccessor(&SwitchNode::m_feedbackInterval),
 	                                  MakeTimeChecker())
+	                    
+	                    // ========== ATC (ccMode=15) Gateway 属性 ==========
+	                    .AddAttribute("GatewayType",
+	                                  "Gateway type for ATC (0=none, 1=source, 2=destination, 3=bidirectional)",
+	                                  UintegerValue(0),
+	                                  MakeUintegerAccessor(&SwitchNode::m_gatewayType),
+	                                  MakeUintegerChecker<uint32_t>())
 	
 	                    ;
 	return tid;
@@ -118,6 +130,19 @@ SwitchNode::SwitchNode() {
 	m_bifrostPfcPeriodUs = 10;
 	m_bifrostLastPfcTimeUs = 0;
 	m_bifrostPfcEvent = EventId();
+
+	// ========== ATC (ccMode=15) 初始化 ==========
+	m_gatewayType = 0; // 默认不是 gateway
+
+	// ========== DCI-Ext (ccMode=16) 初始化（默认关闭，惰性） ==========
+	m_dciExtEnabled = false;
+	m_dciExt.SetSendCallback(MakeCallback(&SwitchNode::SendToDev, this));
+	m_dciExt.SetGetOutDevCallback(MakeCallback(&SwitchNode::GetOutDevice, this));
+	m_dciExt.SetGetDevByIndexCallback(MakeCallback(&SwitchNode::GetDevByIndex, this));
+
+	// ========== ePFC (ccMode=17) 初始化（默认关闭，惰性） ==========
+	m_epfcEnabled = false;
+	m_epfc.SetGateCallback(MakeCallback(&SwitchNode::EpfcGateHelper, this));
 }
 
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch) {
@@ -167,8 +192,17 @@ Ptr<QbbNetDevice>  SwitchNode::GetOutDevice(Ptr< Packet> p, CustomHeader &ch) {
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex) {
+	// DCI 长链路端口 PFC 禁用检查：防止 ACK 回路被阻断导致死锁
+	if (m_pfcDisabledPorts.count(inDev))
+		return;
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldPause(inDev, qIndex)) {
+		// PFC 触发观测：入口队列字节数、动态门限与 headroom 占用量（type 0 = LOSSLESS）
+		printf("[PFC_TRIGGER] %lu switch=%u port=%u q=%u ingress_bytes=%lu threshold=%lu xoffUsed=%lu action=PAUSE\n",
+			Simulator::Now().GetTimeStep(), m_id, inDev, qIndex,
+			m_mmu->ingress_bytes[inDev][qIndex],
+			m_mmu->Threshold(inDev, qIndex, "ingress", 0, 0),
+			m_mmu->GetHdrmBytes(inDev, qIndex));
 		device->SendPfc(qIndex, 0);
 		// std::cout << "sending PFC" << std::endl;
 		m_mmu->SetPause(inDev, qIndex);
@@ -177,6 +211,11 @@ void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex) {
 void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex) {
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldResume(inDev, qIndex)) {
+		printf("[PFC_TRIGGER] %lu switch=%u port=%u q=%u ingress_bytes=%lu threshold=%lu xoffUsed=%lu action=RESUME\n",
+			Simulator::Now().GetTimeStep(), m_id, inDev, qIndex,
+			m_mmu->ingress_bytes[inDev][qIndex],
+			m_mmu->Threshold(inDev, qIndex, "ingress", 0, 0),
+			m_mmu->GetHdrmBytes(inDev, qIndex));
 		device->SendPfc(qIndex, 1);
 		m_mmu->SetResume(inDev, qIndex);
 	}
@@ -201,7 +240,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch) {
 			unsched = tag.GetValue();
 		}
 
-		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || (m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))) { //QCN or PFC or NACK, go highest priority
+		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || ch.l3Prot == 0xFB || ch.l3Prot == 0xFA || (m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))) { //QCN or PFC or ePFC-CCF or DCI-Ext DIP反馈 or NACK, go highest priority
 			qIndex = 0;
 		}
 		else if (found) {
@@ -216,6 +255,13 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch) {
 		InterfaceTag t;
 		bool hasIngressTag = p->PeekPacketTag(t);
 		uint32_t inDev = hasIngressTag ? t.GetPortId() : idx;
+
+		// ePFC (ccMode=17): 打标判定 / CCF边缘建表 / 边缘S累计+超标评估
+		// 位置说明：在 admission control 之前 —— MarkJudge 读到的是本包 admission 前的
+		// ingress/egress 字节数（与 PFC CheckShouldPause 同刻判定）；不拦截，始终放行
+		if (m_epfcEnabled) {
+			m_epfc.PacketIn(inDev, idx, qIndex, p, ch);
+		}
 			
 		// Bifrost: 统计ingress端口收到的字节数（仅在部署Bifrost的交换机上）
 		if (m_bifrostEnabled && m_id == m_bifrostDeploySwitchId && inDev < m_devices.size()) {
@@ -295,6 +341,12 @@ void SwitchNode::ClearTable() {
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch) {
+	// DCI-Ext (ccMode=16): 发送方消费 0xFA 反馈（拦截）；其余建表/统计/ECN清除
+	if (m_dciExtEnabled) {
+		if (m_dciExt.PacketIn(device, packet, ch))
+			return true; // 0xFA 已被发送方 DCI 消费，不再转发
+	}
+
 	// atcGateway处理
 	bool ret = m_atcGateway.packetIn(device, packet, ch);
 	if (ret)
@@ -310,15 +362,27 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 	InterfaceTag t;
 	p->PeekPacketTag(t);
 
-	// DCQCN队列长度监控：输出switch 10/13/15/85的出口队列长度
-	// Switch 85 Port 1 → Host 53 接入链路（当前 flow.txt 瓶颈点）
-	// if (m_id == 10 || m_id == 13 || m_id == 15 || m_id == 85) {
-	if ( m_id == 32 || m_id == 85 || m_id == 93) {
-		Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
-		if (dev) {
-			uint32_t qBytes = dev->GetQueue()->GetNBytesTotal();
-			printf("[DCQCN_QLEN] %lu %u %u %u\n", 
-				Simulator::Now().GetTimeStep(), m_id, ifIndex, qBytes);
+	// DCI-Ext (ccMode=16): 出队统计/门控检查（仅数据包，开销极小）
+	if (m_dciExtEnabled && qIndex != 0) {
+		m_dciExt.NotifyDequeue(ifIndex, qIndex, p);
+	}
+
+	// DCQCN队列长度监控：输出指定交换机的出口队列长度
+	// 通过配置文件 QLEN_MON_SWITCHES 指定监控的交换机 ID 列表
+	// 如果列表为空，则监控所有交换机
+	// qlen_mon_switches 在文件开头已声明（全局命名空间）
+	if (::qlen_mon_switches.empty() || ::qlen_mon_switches.count(m_id) > 0) {
+		static uint64_t s_qlenLastTs[64][8] = {{0}};
+		uint64_t nowTs = Simulator::Now().GetTimeStep();
+		if (ifIndex < 64 && qIndex < 8 && nowTs - s_qlenLastTs[ifIndex][qIndex] > 100000) {
+			s_qlenLastTs[ifIndex][qIndex] = nowTs;
+			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
+			if (dev) {
+				uint32_t qBytes = dev->GetQueue()->GetNBytesTotal();
+				printf("[DCQCN_QLEN] %lu %u %u %u mmu_eg=%lu\n", 
+					Simulator::Now().GetTimeStep(), m_id, ifIndex, qBytes,
+					(unsigned long)m_mmu->egress_bytes[ifIndex][qIndex]);
+			}
 		}
 	}
 
@@ -335,6 +399,16 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
             bool egressCongested = m_mmu->ShouldSendCN(ifIndex, qIndex);
             if (egressCongested)
             {
+                Ptr<QbbNetDevice> ecnDev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
+                uint32_t ecnQlen = ecnDev ? ecnDev->GetQueue()->GetNBytesTotal() : 0;
+                {
+                    PppHeader eh; Ipv4Header eip;
+                    Ptr<Packet> ec = p->Copy();
+                    ec->RemoveHeader(eh); ec->RemoveHeader(eip);
+                    printf("[ECN_MARK] %lu node=%u if=%u q=%u qlen=%u sip=0x%08x dip=0x%08x\n", 
+                        Simulator::Now().GetTimeStep(), m_id, ifIndex, qIndex, ecnQlen,
+                        eip.GetSource().Get(), eip.GetDestination().Get());
+                }
                 PppHeader ppp;
                 Ipv4Header h;
                 p->RemoveHeader(ppp);
@@ -948,6 +1022,260 @@ void SwitchNode::SendBifrostPfcWithCustomTime() {
 uint32_t SwitchNode::CalculateBifrostPauseTime(uint32_t qIndex, uint32_t qLenBytes, uint32_t r) {
     // TODO: 后续根据队列长度、r、链路速率等动态计算
     return 50;  // 占位符：固定50us
+}
+
+/**
+ * 从配置文件读取 Bifrost 参数
+ * @param configFile 配置文件路径
+ */
+void SwitchNode::ReadBifrostConfigFromFile(const std::string& configFile) {
+    std::ifstream conf(configFile.c_str());
+    if (!conf.is_open()) {
+        std::cerr << "[BIFROST] Error: Cannot open config file: " << configFile << std::endl;
+        return;
+    }
+    
+    std::string key;
+    uint32_t pfcPeriod = 10; // 默认值
+    
+    while (conf >> key) {
+        if (key.compare("BIFROST_PFC_PERIOD") == 0) {
+            conf >> pfcPeriod;
+            break;
+        }
+        // 跳过行尾
+        std::string line;
+        std::getline(conf, line);
+    }
+    
+    conf.close();
+    
+    m_bifrostPfcPeriodUs = pfcPeriod;
+    std::cout << "[BIFROST] Switch " << GetId() << " read config: PFC period = " << pfcPeriod << " us" << std::endl;
+}
+
+/**
+ * 初始化 Bifrost（在 DCI 交换机上启用）
+ * @param switchId 交换机 ID
+ */
+void SwitchNode::InitializeBifrost(uint32_t switchId) {
+    m_bifrostEnabled = true;
+    m_bifrostDeploySwitchId = switchId;
+    
+    SetAttribute("CcMode", UintegerValue(12));
+    SetAttribute("BifrostEnabled", BooleanValue(true));
+    SetAttribute("BifrostPfcPeriodUs", UintegerValue(m_bifrostPfcPeriodUs));
+    SetAttribute("BifrostDeploySwitchId", UintegerValue(switchId));
+    
+    StartBifrostPfcMechanism();
+    
+    std::cout << "[BIFROST] Initialized on DCI switch " << switchId 
+              << " with PFC period = " << m_bifrostPfcPeriodUs << " us" << std::endl;
+}
+
+// ========== ATC (ccMode=15) Gateway 实现 ==========
+
+/**
+ * 设置配置文件路径
+ * @param configPath 配置文件路径
+ */
+void SwitchNode::SetConfigFilePath(const std::string& configPath) {
+    m_configFilePath = configPath;
+    std::cout << "[ATC] Switch " << GetId() << " config file path set: " << configPath << std::endl;
+}
+
+/**
+ * 配置 ATC 参数
+ * @param config ATC 配置结构
+ */
+void SwitchNode::ConfigureAtc(const AtcConfig& config) {
+    m_atcConfig = config;
+    std::cout << "[ATC] Switch " << GetId() << " configured with:" << std::endl;
+    std::cout << "  VOQ max size: " << m_atcConfig.voq_max_size << std::endl;
+    std::cout << "  CNP notify interval: " << m_atcConfig.cnp_notify_interval_us << " us" << std::endl;
+    std::cout << "  Min rate: " << m_atcConfig.min_rate << std::endl;
+    std::cout << "  Max VOQ count: " << m_atcConfig.max_voq_count << std::endl;
+}
+
+/**
+ * 初始化 ATC Gateway
+ * @param gatewayType Gateway 类型: 1=source, 2=destination, 3=bidirectional
+ */
+void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
+    if (gatewayType == 0) {
+        return; // 不是 gateway
+    }
+    
+    m_gatewayType = gatewayType;
+    
+    // 配置 ATC 参数
+    m_atcGateway.ConfigureAtcParams(
+        m_atcConfig.voq_max_size,
+        m_atcConfig.cnp_notify_interval_us,
+        m_atcConfig.min_rate,
+        m_atcConfig.rate_decrease_interval_us,
+        m_atcConfig.rpg_time_reset_us,
+        m_atcConfig.cnp_on_global_congestion,
+        m_atcConfig.voq_react_to_cnp,
+        m_atcConfig.voq_inflight_rtt_us
+    );
+    
+    // 初始化 Gateway
+    m_atcGateway.init(
+        gatewayType,
+        m_atcConfig.max_voq_count,
+        m_atcConfig.max_voq_rate,
+        m_atcConfig.long_haul_bandwidth,
+        m_atcConfig.long_haul_delay
+    );
+    
+    std::string gatewayTypeStr;
+    if (gatewayType == 1) gatewayTypeStr = "source";
+    else if (gatewayType == 2) gatewayTypeStr = "destination";
+    else if (gatewayType == 3) gatewayTypeStr = "bidirectional";
+    
+    std::cout << "[ATC] Initialized " << gatewayTypeStr << " gateway on switch " << GetId() << std::endl;
+}
+
+// ============================================================================
+// DCI-Ext (ccMode=16) v3: DCI 交换机初始化（表驱动，无门控）
+//   发送侧（senderSide=true）：表A DIP速度表 + 流观察期(20MB→学费CNP→1ms静默→查表)
+//                               + ECN 快速反馈 + 0xFA 反馈消费/查表连发
+//   接收侧（senderSide=false）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
+// ============================================================================
+void SwitchNode::InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
+                                   double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
+                                   uint32_t agingPeriods, bool senderSide,
+                                   double dtUs, double sigmaUs) {
+    m_dciExtEnabled = true;
+    m_dciExt.SetSenderSide(senderSide);
+    m_dciExt.Configure(nodeId, burstIntervalUs, periodTUs, dipBwGbps,
+                       observeMb, silentUs, agingPeriods, dtUs, sigmaUs);
+    std::cout << "[DCIEXT] Initialized DCI-Ext v3 on switch " << GetId()
+              << (senderSide ? " (SENDER: 表A+观察期+ECN反馈+0xFA消费)"
+                             : " (RECEIVER: RTT探测+周期0xFA反馈)")
+              << " (T=" << periodTUs << "us, dipBw=" << dipBwGbps << "G"
+              << ", observe=" << observeMb << "MB, silent=" << silentUs << "us"
+              << ", aging=" << agingPeriods << "T"
+              << ", Dt=" << dtUs << "us, sigma=" << sigmaUs << "us)" << std::endl;
+}
+
+// 端口设备查询（DCI-Ext NotifyDequeue 判定出端口是否长链路用）
+Ptr<NetDevice> SwitchNode::GetDevByIndex(uint32_t ifIndex) {
+    if (ifIndex >= m_devices.size())
+        return nullptr;
+    return m_devices[ifIndex];
+}
+
+// 禁用指定端口的 PFC 发送（DCI 长链路端口防死锁）
+void SwitchNode::DisablePfcOnPort(uint32_t port) {
+    m_pfcDisabledPorts.insert(port);
+    // 同时设置该端口忽略收到的 PFC 帧（双向禁用，彻底隔离长链路的 PFC 反压）
+    if (port < m_devices.size()) {
+        Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[port]);
+        if (dev) {
+            dev->SetIgnoreReceivedPfc(true);
+        }
+    }
+    std::cout << "[DCIEXT] Disabled PFC on switch " << GetId() << " port " << port << " (send+receive)" << std::endl;
+}
+
+// ============================================================================
+// ePFC (ccMode=17)：初始化（角色一打标 + 接收方DCI流表）+ 出口本地门控 helper
+// ============================================================================
+void SwitchNode::InitializeEpfc(uint32_t nodeId, uint32_t ingressMulPct, uint64_t egressThreshBytes,
+                                uint64_t dciThreshBytes, double rttUs, double agingRtts,
+                                double updateTUs) {
+    m_epfcEnabled = true;
+    m_epfc.SetMmu(m_mmu);
+    m_epfc.Configure(nodeId, ingressMulPct, egressThreshBytes, dciThreshBytes,
+                     rttUs, agingRtts, updateTUs);
+    std::cout << "[EPFC] Initialized ePFC on switch " << GetId()
+              << " (ingressMulPct=" << ingressMulPct
+              << ", egressThresh=" << egressThreshBytes << "B"
+              << ", dciThresh=" << dciThreshBytes << "B"
+              << ", rtt=" << rttUs << "us, aging=" << agingRtts << "rtt"
+              << ", updateT=" << updateTUs << "us)" << std::endl;
+    // S 计量挂点注入：QbbNetDevice 实际出队（TransmitStart 前）回调本节点 helper，
+    // 使 S 口径 = 物理发出字节（门控拦下的包不出队不计 S，门控真正限流）
+    for (uint32_t i = 0; i < m_devices.size(); i++) {
+        Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[i]);
+        if (dev)
+            dev->SetEpfcDequeueCallback(MakeCallback(&SwitchNode::EpfcDequeueHelper, this));
+    }
+}
+
+// ePFC 门控回调：本地门控指定端口的指定 pg（独立于 PFC 状态，停的是自己出口的出队）
+void SwitchNode::EpfcGateHelper(uint32_t portIdx, uint8_t pg, bool on) {
+    if (portIdx >= m_devices.size())
+        return;
+    Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[portIdx]);
+    if (dev)
+        dev->SetDciExtGate(pg, on);
+}
+
+// ePFC 出队计量回调：QbbNetDevice 实际出队（TransmitStart 前）触发。
+//   读出队 Tag → 调 Epfc::DataDequeue 累计 S 并评估门控 ——
+//   S 口径 = 物理发出字节：门控中被拦的包不出队、不经过此处（天然不计 S），
+//   XON 后倾泻的存量也如实计入，修复旧实现（入队前计 S）的门控架空问题
+void SwitchNode::EpfcDequeueHelper(uint32_t outPort, Ptr<Packet> p) {
+    if (!m_epfcEnabled)
+        return;
+    EpfcSAccountTag tag;
+    if (p->PeekPacketTag(tag)) {
+        uint32_t payload = p->GetSize() - CustomHeader::GetStaticWholeHeaderSize();
+        m_epfc.DataDequeue(outPort, tag, payload);
+        p->RemovePacketTag(tag);
+    }
+}
+
+/**
+ * 从配置文件读取 ATC 参数
+ * @param configFile 配置文件路径
+ */
+void SwitchNode::ReadAtcConfigFromFile(const std::string& configFile) {
+    std::ifstream conf(configFile.c_str());
+    if (!conf.is_open()) {
+        std::cerr << "[ATC] Error: Cannot open config file: " << configFile << std::endl;
+        return;
+    }
+    
+    std::string key;
+    AtcConfig config;
+    
+    while (conf >> key) {
+        if (key.compare("ATC_VOQ_MAX_SIZE") == 0) {
+            conf >> config.voq_max_size;
+        } else if (key.compare("ATC_CNP_NOTIFY_INTERVAL") == 0) {
+            conf >> config.cnp_notify_interval_us;
+        } else if (key.compare("ATC_MIN_RATE") == 0) {
+            conf >> config.min_rate;
+        } else if (key.compare("ATC_RATE_DECREASE_INTERVAL") == 0) {
+            conf >> config.rate_decrease_interval_us;
+        } else if (key.compare("ATC_RPG_TIME_RESET") == 0) {
+            conf >> config.rpg_time_reset_us;
+        } else if (key.compare("ATC_CNP_ON_GLOBAL_CONGESTION") == 0) {
+            uint32_t v;
+            conf >> v;
+            config.cnp_on_global_congestion = (v != 0);
+        } else if (key.compare("ATC_VOQ_REACT_TO_CNP") == 0) {
+            uint32_t v;
+            conf >> v;
+            config.voq_react_to_cnp = (v != 0);
+        } else if (key.compare("ATC_VOQ_INFLIGHT_RTT_US") == 0) {
+            conf >> config.voq_inflight_rtt_us;
+        } else if (key.compare("MAX_ATC_VOQ_COUNT") == 0) {
+            conf >> config.max_voq_count;
+        } else if (key.compare("MAX_ATC_VOQ_RATE") == 0) {
+            conf >> config.max_voq_rate;
+        }
+        // 跳过行尾
+        std::string line;
+        std::getline(conf, line);
+    }
+    
+    conf.close();
+    ConfigureAtc(config);
 }
 
 } /* namespace ns3 */

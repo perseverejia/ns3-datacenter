@@ -38,6 +38,8 @@ build_lib(
     model/frp-rate-calculator.cc
     helper/qbb-helper.cc
     model/atcGateway.cc
+    model/dci-ext.cc
+    model/epfc.cc
   HEADER_FILES
     ${mpi_headers}
     helper/point-to-point-helper.h
@@ -61,6 +63,8 @@ build_lib(
     helper/qbb-helper.h
     helper/sim-setting.h
     model/atcGateway.h
+    model/dci-ext.h
+    model/epfc.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}
                     ${internet}

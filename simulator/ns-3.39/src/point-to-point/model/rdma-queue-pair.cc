@@ -37,11 +37,19 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_var_win = false;
 	m_rate = 0;
 	m_nextAvail = Time(0);
+	lastPktSize = 0;
+	lastPayloadSize = 0;
 	mlx.m_alpha = 1;
 	mlx.m_alpha_cnp_arrived = false;
 	mlx.m_first_cnp = true;
 	mlx.m_decrease_cnp_arrived = false;
 	mlx.m_rpTimeStage = 0;
+	mlx.m_rpCountStage = 0;
+	mlx.m_rpByteCount = 0;
+	mlx.m_byteRecoveryActive = false;
+	m_epfcLimitBps = 0;
+	m_epfcLimitUntil = Time(0);
+	m_epfcPauseUntil = Time(0);
 	hp.m_lastUpdateSeq = 0;
 	for (uint32_t i = 0; i < sizeof(hp.keep) / sizeof(hp.keep[0]); i++)
 		hp.keep[i] = 0;
@@ -128,6 +136,9 @@ uint64_t RdmaQueuePair::GetOnTheFly() {
 }
 
 bool RdmaQueuePair::IsWinBound() {
+	// ePFC (ccMode=17)：排空暂停期内停发（IsWinBound 恒 true，发送器不取本 QP 的包）
+	if (m_epfcPauseUntil > Simulator::Now())
+		return true;
 	uint64_t w = GetWin();
 	return w != 0 && GetOnTheFly() >= w;
 }
@@ -196,6 +207,10 @@ RdmaRxQueuePair::RdmaRxQueuePair() {
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
 	m_recv_bytes = 0;
+	// ePFC (ccMode=17)：CCF 节流与 rv 采样状态
+	m_epfcLastCcfTime = Time(0);
+	m_epfcSampleTime = Time(0);
+	m_epfcSampleBytes = 0;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void) {

@@ -720,7 +720,7 @@ bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t p
 			        // if the switch buffer is full
 			        || (psize + totalUsed > bufferPool)  )
 			{
-				std::cout << "dropping lossless packet at ingress admission headroom " << GetHdrmBytes(port, qIndex) << " xoff " << xoff[port][qIndex] << " pktSize " << psize << " xoffTotalUsed " << xoffTotalUsed << " totalUsed " <<  totalUsed << std::endl;
+				std::cout << "dropping lossless packet at ingress admission node " << node_id << " port " << port << " q " << qIndex << " headroom " << GetHdrmBytes(port, qIndex) << " xoff " << xoff[port][qIndex] << " pktSize " << psize << " xoffTotalUsed " << xoffTotalUsed << " totalUsed " <<  totalUsed << std::endl;
 				return false;
 			}
 			else {
@@ -1016,7 +1016,12 @@ bool SwitchMmu::CheckShouldResume(uint32_t port, uint32_t qIndex) {
 	if (!paused[port][qIndex])
 		return false;
 	if (model == "sonic") {
-		return GetHdrmBytes(port, qIndex) == 0 && (ingress_bytes[port][qIndex] < xon[port][qIndex] || ingress_bytes[port][qIndex] + xon_offset[port][qIndex] <= Threshold(port, qIndex, "ingress", LOSSLESS, 0) );
+		// 方案A：RESUME 滞回区间 = max(xon_offset, 门限的30%)。
+		// 原始 xon_offset 仅 2496B(约2个报文)，headroom 排空即放水，形成 ~124µs 微振荡并反复冲刷 headroom 导致丢包；
+		// 拉大滞回后队列需回落到门限的 70% 以下才 RESUME，上游突发由共享池吸收，PAUSE 长期 hold。
+		uint64_t thresh = Threshold(port, qIndex, "ingress", LOSSLESS, 0);
+		uint64_t hysteresis = std::max<uint64_t>(xon_offset[port][qIndex], thresh * 3 / 10);
+		return GetHdrmBytes(port, qIndex) == 0 && (ingress_bytes[port][qIndex] < xon[port][qIndex] || ingress_bytes[port][qIndex] + hysteresis <= thresh);
 	}
 	else if (model == "reverie") {
 		return GetHdrmBytes(port, qIndex) == 0 && (ingressLpf_bytes[port][qIndex] < xon[port][qIndex] || ingressLpf_bytes[port][qIndex] + xon_offset[port][qIndex] <= ReverieThreshold(port, qIndex, LOSSLESS, 0) );

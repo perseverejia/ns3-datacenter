@@ -14,7 +14,9 @@
 #include "cn-header.h"
 #include "ns3/unsched-tag.h"
 #include "ns3/icmpv4.h"  // 添加ICMP FRP支持
+#include "epfc.h"        // ePFC (ccMode=17)：标记位定义
 #include <cmath>         // std::abs
+#include <cstring>       // memcpy
 
 namespace ns3 {
 
@@ -89,6 +91,16 @@ TypeId RdmaHw::GetTypeId (void)
 	                                  UintegerValue(5),
 	                                  MakeUintegerAccessor(&RdmaHw::m_rpgThreshold),
 	                                  MakeUintegerChecker<uint32_t>())
+	                    .AddAttribute("DcqcnByteRecoveryEnabled",
+	                                  "Enable an additional DCQCN rate increase for each per-QP payload-byte threshold after a rate decrease.",
+	                                  BooleanValue(false),
+	                                  MakeBooleanAccessor(&RdmaHw::m_dcqcnByteRecoveryEnabled),
+	                                  MakeBooleanChecker())
+	                    .AddAttribute("DcqcnByteRecoveryThreshold",
+	                                  "Payload bytes sent per additional DCQCN rate-increase event.",
+	                                  UintegerValue(150 * 1024),
+	                                  MakeUintegerAccessor(&RdmaHw::m_dcqcnByteRecoveryThreshold),
+	                                  MakeUintegerChecker<uint64_t>(1))
 	                    .AddAttribute("AlphaResumInterval",
 	                                  "The interval of resuming alpha",
 	                                  DoubleValue(55.0),
@@ -191,6 +203,7 @@ TypeId RdmaHw::GetTypeId (void)
 }
 
 RdmaHw::RdmaHw() {
+	m_epfcRttUs = 30.0; // ePFC (ccMode=17)：内部流 RTT 默认值（workload 可覆盖）
 }
 
 void RdmaHw::SetNode(Ptr<Node> node) {
@@ -279,7 +292,7 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 		qp->SetWin(m_bps.GetBitRate() * 1 * baseRtt * 1e-9 / 8);
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
-	if (m_cc_mode == 1) {
+	if (m_cc_mode == 1 || m_cc_mode == 16 || m_cc_mode == 17) { // mlx version (16=DCI-Ext, 17=ePFC 均复用 DCQCN 发送端)
 		qp->mlx.m_targetRate = m_bps;
 	} else if (m_cc_mode == 3) {
 		qp->hp.m_curRate = m_bps;
@@ -357,6 +370,11 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 
 	// TODO find corresponding rx queue pair
 	Ptr<RdmaRxQueuePair> rxQp = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
+
+	// ePFC (ccMode=17)：拥塞贡献者标记包（IPv4 TOS bit7）→ 节流生成 CCF 回发
+	if (m_cc_mode == 17 && (ch.m_tos & EPFC_MARK_MASK)) {
+		EpfcCcfGen(rxQp, ch);
+	}
 	if (ecnbits != 0) {
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
@@ -402,6 +420,144 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 	return 0;
 }
 
+// ---------------------------------------------------------------------------
+// ePFC (ccMode=17)：接收方收到标记包 → 节流生成 CCF 回发
+//   CCF = PPP + IPv4(0xFB) + qbbHeader + payload{rv_bps:8B, ts_ns:8B}
+//   五元组由 IP 头（src=本机接收方, dst=数据源）与 qbbHeader（端口反转）携带
+//   rv = 最近采样窗口的平均接收速率（窗口 ≈ CCF 节流周期 = 1×RTT_internal）
+//   沿途每个边缘交换机（下一跳 host / 接收方DCI）旁路更新拥塞数据流表
+// ---------------------------------------------------------------------------
+void RdmaHw::EpfcCcfGen(Ptr<RdmaRxQueuePair> rxQp, CustomHeader &ch) {
+	Time now = Simulator::Now();
+	// 节流：每 RTT_internal 最多一个 CCF
+	if (rxQp->m_epfcLastCcfTime != Time(0) &&
+	    (now - rxQp->m_epfcLastCcfTime) < MicroSeconds(m_epfcRttUs))
+		return;
+
+	// rv：上一采样窗口的平均接收速率（bps）
+	double windowSec = (now - rxQp->m_epfcSampleTime).GetSeconds();
+	double rvBps = 0;
+	if (rxQp->m_epfcSampleTime != Time(0) && windowSec > 1e-9) {
+		rvBps = (double)(rxQp->m_recv_bytes - rxQp->m_epfcSampleBytes) * 8.0 / windowSec;
+	}
+	rxQp->m_epfcSampleBytes = rxQp->m_recv_bytes;
+	rxQp->m_epfcSampleTime = now;
+	rxQp->m_epfcLastCcfTime = now;
+	if (rvBps < 1e9) {
+		// rv 下限保护：<1G 视为采样污染，不发 CCF：
+		// - 首个采样窗口无历史（rv=0）
+		// - PFC 停顿期接收侧到达≈0（这是接收侧被暂停，不是发送方超额）
+		// 若此时反馈，发送方会在窗口内被钳在污染 rv 上形成自锁；
+		// 采样基准已更新，下一个标记包（>=1×RTT 后）即可携带真实 rv
+		return;
+	}
+
+	// 造 CCF（q=0 高优先级，与 ACK 同通道，不受数据 PG 暂停影响）
+	qbbHeader seqh;
+	seqh.SetSeq(0);
+	seqh.SetPG(ch.udp.pg);
+	seqh.SetSport(ch.udp.dport); // 端口与数据流反转（回发惯例）
+	seqh.SetDport(ch.udp.sport);
+	uint8_t payload[16];
+	uint64_t rvU64 = (uint64_t)rvBps;
+	uint64_t tsNs = (uint64_t)now.GetNanoSeconds();
+	memcpy(payload, &rvU64, 8);
+	memcpy(payload + 8, &tsNs, 8);
+	Ptr<Packet> newp = Create<Packet>(payload, 16);
+	newp->AddHeader(seqh);
+
+	Ipv4Header head;
+	head.SetDestination(Ipv4Address(ch.sip)); // 数据流源（发送方 host）
+	head.SetSource(Ipv4Address(ch.dip));      // 本机（接收方 host）
+	head.SetProtocol(0xFB);                   // ePFC CCF
+	head.SetTtl(64);
+	head.SetPayloadSize(newp->GetSize());
+	head.SetIdentification(rxQp->m_ipid++);
+	newp->AddHeader(head);
+	AddHeader(newp, 0x800); // Attach PPP header
+
+	uint32_t nic_idx = GetNicIdxOfRxQp(rxQp);
+	m_nic[nic_idx].dev->RdmaEnqueueHighPrioQ(newp);
+	m_nic[nic_idx].dev->TriggerTransmit();
+
+	printf("[EPFC_CCF_GEN] %lu node=%u sip=0x%08x dip=0x%08x sport=%u dport=%u pg=%u rv=%.3fG\n",
+		Simulator::Now().GetTimeStep(), m_node->GetId(),
+		ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, ch.udp.pg, rvBps / 1e9);
+}
+
+// ePFC：发送方收到 CCF → 先暂停排空，再按 rv 传输（v6.1）
+//   暂停 Tp = (线速-rv)×RTT_internal/rv，上限 m_epfcMaxPauseUs（必须 < 内部 RTT，防 ACK 在暂停期内到齐饿死）：
+//   线速满管时超出部分在途量 (线速-rv)×RTT 按 rv 排空所需时间，避免直接切 rv 时旧突发仍堆在瓶颈处累积
+//   暂停期由 IsWinBound 停发；到期后按 rv 传输 2×RTT_internal（窗口已按 rv 缩放）
+//   一个 CCF 周期 = 暂停 + 2×RTT；周期内到达的 CCF 直接丢弃，周期完整走完后才接收下一个；
+//   周期过期自动失效，交回 DCQCN 全权接管，直至下一个 CCF 开启新周期
+void RdmaHw::EpfcCcfRecv(Ptr<Packet> p, CustomHeader &ch) {
+	if (m_cc_mode != 17)
+		return;
+	// 读 CCF payload 前 16B: {rv_bps, ts_ns}
+	Ptr<Packet> cp = p->Copy();
+	PppHeader ppp;
+	Ipv4Header iph;
+	qbbHeader qh;
+	cp->RemoveHeader(ppp);
+	cp->RemoveHeader(iph);
+	cp->RemoveHeader(qh);
+	uint8_t buf[16] = {0};
+	cp->CopyData(buf, std::min<size_t>(16, cp->GetSize()));
+	uint64_t rvU64 = 0;
+	memcpy(&rvU64, buf, 8);
+	double rvBps = (double)rvU64;
+	if (rvBps <= 0)
+		return; // rv=0 无效（发送方在 edge 判据里同样跳过）
+	// 找数据流 QP：CCF 的 sip=数据流 dip，ack.dport=数据流 sport
+	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.dport, ch.ack.pg);
+	if (qp == NULL)
+		return;
+	// 周期内丢弃：暂停+2×RTT 的 CCF 周期未走完前，后续 CCF 直接扔掉——
+	// 不刷新暂停/速率/窗口，保证一个周期（暂停→按rv传输2×RTT）完整执行；
+	// 否则 30μs 节拍的 CCF 会无限续借暂停期（每个 CCF 重置 32μs），流被停发锁死
+	if (qp->m_epfcLimitUntil > Simulator::Now()) {
+		printf("[EPFC_CCF_DROP] %lu node=%u rv=%.3fG (cycle until %luus)\n",
+			Simulator::Now().GetTimeStep(), m_node->GetId(),
+			rvBps / 1e9, qp->m_epfcLimitUntil.GetMicroSeconds());
+		return;
+	}
+	// v6.1：先暂停排空再按 rv 传输（双向拉起+压下）。
+	// v2 自锁教训（0.095G/10ms）已由三层保护消除：
+	//   ① 接收方 rv<1G 视为采样污染不发 CCF（源头挡污染）
+	//   ② 标记随拥塞消失断流，不会持续灌入污染 rv
+	//   ③ 窗口过期自动放权，速率从 rv 出发交回 DCQCN 自由演进
+	double lineBps = (double)m_nic[GetNicIdxOfQp(qp)].dev->GetDataRate().GetBitRate();
+	// 暂停仅用于「降速排空」：当前速率高于 rv 才需要暂停清在途超额；
+	// 稳态（m_rate ≤ rv，由 CNP 下限钳制保证）再暂停会让平均速率跌到 0.75×rv
+	bool needDrain = qp->m_rate.GetBitRate() > rvBps;
+	double pauseSec = 0;
+	if (needDrain && rvBps < lineBps)
+		pauseSec = (lineBps - rvBps) * (m_epfcRttUs * 1e-6) / rvBps;
+	// 暂停上限：必须 < 内部流 RTT（30μs），否则短 RTT 流的在途 ACK 会在暂停期内
+	// 全部到齐，暂停结束后无任何事件触发发送轮询 → 流饿死。上限 20μs = 2/3 RTT
+	double pauseCapSec = m_epfcMaxPauseUs * 1e-6;
+	if (pauseSec > pauseCapSec)
+		pauseSec = pauseCapSec;
+	qp->m_rate = DataRate((uint64_t)rvBps);
+	qp->mlx.m_targetRate = DataRate((uint64_t)rvBps);
+	qp->m_epfcLimitBps = rvBps; // 防爬升兜底（RateIncEventMlx 尾部钳制）
+	qp->m_epfcPauseUntil = Simulator::Now() + Seconds(pauseSec);
+	qp->m_epfcLimitUntil = qp->m_epfcPauseUntil + MicroSeconds(2 * m_epfcRttUs);
+	// 暂停到期主动唤醒：短 RTT 流（5→6 内部 RTT=30μs ≤ 暂停 32μs）的 ACK 会在
+	// 暂停期内全部到齐，到期时零在途/零待ACK/CCF 已断流，事件驱动的发送器若无
+	// 此 kick，DequeueAndTransmit 永远不会再被调用（实测 5→6 因此饿死）
+	Simulator::Schedule(Seconds(pauseSec), &QbbNetDevice::TriggerTransmit,
+		m_nic[GetNicIdxOfQp(qp)].dev);
+	#if PRINT_LOG
+	printf("[EPFC_CCF_RATE] %lu node=%u rv=%.3fG rate=%.3fG tgt=%.3fG pause=%luus until=%luus\n",
+		Simulator::Now().GetTimeStep(), m_node->GetId(),
+		rvBps / 1e9, qp->m_rate.GetBitRate() * 1e-9,
+		qp->mlx.m_targetRate.GetBitRate() * 1e-9,
+		(uint64_t)(pauseSec * 1e6), qp->m_epfcLimitUntil.GetMicroSeconds());
+	#endif
+}
+
 int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 	// QCN on NIC
 	// This is a Congestion signal
@@ -429,7 +585,7 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 	if (qp->m_rate == 0)			//lazy initialization
 	{
 		qp->m_rate = dev->GetDataRate();
-		if (m_cc_mode == 1) {
+		if (m_cc_mode == 1 || m_cc_mode == 16 || m_cc_mode == 17) { // DCI-Ext/ePFC 复用 DCQCN 发送端
 			qp->mlx.m_targetRate = dev->GetDataRate();
 		} else if (m_cc_mode == 3) {
 			qp->hp.m_curRate = dev->GetDataRate();
@@ -496,7 +652,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
 			printf("[DCQCN_CNP_CHECK] %.3fms node=%u cnp=%u cc_mode=%u\n",
 				Simulator::Now().GetSeconds() * 1000.0, m_node->GetId(), cnp, m_cc_mode);
 		}
-		if (m_cc_mode == 1) { // mlx version
+		if (m_cc_mode == 1 || m_cc_mode == 16 || m_cc_mode == 17) { // mlx version (16=DCI-Ext, 17=ePFC)
 			cnp_received_mlx(qp);
 		}
 	}
@@ -525,6 +681,8 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch) {
 		ReceiveAck(p, ch);
 	} else if (ch.l3Prot == 0xFC) { // ACK
 		ReceiveAck(p, ch);
+	} else if (ch.l3Prot == 0xFB) { // ePFC CCF：发送方限速（2×RTT 内封顶 MIN(rate, rv)）
+		EpfcCcfRecv(p, ch);
 	} else if (ch.l3Prot == 0x01) { // ICMP
 		ReceiveIcmp(p, ch);
 	}
@@ -579,7 +737,7 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp) {
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp) {
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
-	if (m_cc_mode == 1) {
+	if (m_cc_mode == 1 || m_cc_mode == 16 || m_cc_mode == 17) { // DCI-Ext/ePFC 复用 DCQCN
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
 		Simulator::Cancel(qp->mlx.m_rpTimer);
@@ -631,6 +789,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
 	uint32_t payload_size = qp->GetBytesLeft();
 	if (m_mtu < payload_size)
 		payload_size = m_mtu;
+	qp->lastPayloadSize = payload_size;
 	Ptr<Packet> p = Create<Packet> (payload_size);
 	uint32_t sentBytes = qp->m_size - qp->GetBytesLeft();
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
@@ -684,6 +843,9 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 	uint32_t seq = qp->snd_nxt;
 	qp->rates[qp->snd_nxt] = Simulator::Now().GetNanoSeconds();
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
+	if (m_cc_mode == 1 || m_cc_mode == 16 || m_cc_mode == 17) { // DCI-Ext/ePFC 复用 DCQCN
+		RateIncByteCounterMlx(qp, qp->lastPayloadSize);
+	}
 
 }
 
@@ -710,11 +872,13 @@ void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
 	// Keep DCQCN queue logs and TX RATE logs on stdout.  Both use the same
 	// stdio stream, so each printf call is serialized instead of being
 	// interleaved after the runner redirects stdout and stderr to one file.
+	#if PRINT_LOG
 	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps t %luns\n",
 	        m_node->GetId(),
 	        qp->sip.Get(), qp->dip.Get(),
 	        qp->sport, qp->dport, qp->m_pg,
 	        rateBps, now.GetNanoSeconds());
+	#endif
 
 	qp->txRate.lastSeq = curSeq;
 	qp->txRate.lastTime = now;
@@ -734,7 +898,7 @@ void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate) {
 	qp->m_rate = new_rate;
 }
 
-#define PRINT_LOG 1
+#define PRINT_LOG 0
 /******************************
  * Mellanox's version of DCQCN
  *****************************/
@@ -759,8 +923,11 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q) {
 }
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q) {
-	printf("[DCQCN_CNP] %.3fms node=%u cnp_received sip=0x%08x dip=0x%08x first_cnp=%d alpha=%.4f rate=%.3fG\n",
-		Simulator::Now().GetSeconds() * 1000.0, m_node->GetId(), q->sip.Get(), q->dip.Get(), q->mlx.m_first_cnp, q->mlx.m_alpha, q->m_rate.GetBitRate() * 1e-9);
+	#if PRINT_LOG
+	printf("[DCQCN_CNP] %.3fms node=%u cnp_received sip=0x%08x dip=0x%08x sport=%u dport=%u first_cnp=%d alpha=%.4f rate=%.3fG\n",
+		Simulator::Now().GetSeconds() * 1000.0, m_node->GetId(), q->sip.Get(), q->dip.Get(), q->sport, q->dport,
+		q->mlx.m_first_cnp, q->mlx.m_alpha, q->m_rate.GetBitRate() * 1e-9);
+	#endif
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update
 	q->mlx.m_decrease_cnp_arrived = true; // set CNP_arrived bit for rate decrease
 	if (q->mlx.m_first_cnp) {
@@ -790,9 +957,18 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q) {
 		}
 		if (clamp)
 			q->mlx.m_targetRate = q->m_rate;
-		q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlx.m_alpha / 2));
+		// ePFC (ccMode=17)：CCF 设速窗口内 CNP 降速下限钳制在 rv——
+		// CCF 每 90μs 才设速一次（周期机制），CNP 持续到达持续降速，降多设少会净向下漂移；
+		// 窗口期由 ePFC 主导（CCF 即速率指令），DCQCN 降速不得低于 rv
+		DataRate decFloor = m_minRate;
+		if (m_cc_mode == 17 && q->m_epfcLimitUntil > Simulator::Now() && q->m_epfcLimitBps > 0)
+			decFloor = DataRate((uint64_t)q->m_epfcLimitBps);
+		q->m_rate = std::max(decFloor, q->m_rate * (1 - q->mlx.m_alpha / 2));
 		// reset rate increase related things
 		q->mlx.m_rpTimeStage = 0;
+		q->mlx.m_rpCountStage = 0;
+		q->mlx.m_rpByteCount = 0;
+		q->mlx.m_byteRecoveryActive = m_dcqcnByteRecoveryEnabled;
 		q->mlx.m_decrease_cnp_arrived = false;
 		Simulator::Cancel(q->mlx.m_rpTimer);
 		q->mlx.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset), &RdmaHw::RateIncEventTimerMlx, this, q);
@@ -807,17 +983,37 @@ void RdmaHw::ScheduleDecreaseRateMlx(Ptr<RdmaQueuePair> q, uint32_t delta) {
 
 void RdmaHw::RateIncEventTimerMlx(Ptr<RdmaQueuePair> q) {
 	q->mlx.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset), &RdmaHw::RateIncEventTimerMlx, this, q);
-	RateIncEventMlx(q);
+	RateIncEventMlx(q, q->mlx.m_rpTimeStage);
 	q->mlx.m_rpTimeStage++;
 }
-void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q) {
+void RdmaHw::RateIncByteCounterMlx(Ptr<RdmaQueuePair> q, uint32_t payloadBytes) {
+	if (!m_dcqcnByteRecoveryEnabled || !q->mlx.m_byteRecoveryActive || payloadBytes == 0) {
+		return;
+	}
+	q->mlx.m_rpByteCount += payloadBytes;
+	while (q->mlx.m_rpByteCount >= m_dcqcnByteRecoveryThreshold) {
+		q->mlx.m_rpByteCount -= m_dcqcnByteRecoveryThreshold;
+		RateIncEventMlx(q, q->mlx.m_rpCountStage);
+		q->mlx.m_rpCountStage++;
+	}
+}
+void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q, uint32_t stage) {
 	// check which increase phase: fast recovery, active increase, hyper increase
-	if (q->mlx.m_rpTimeStage < m_rpgThreshold) { // fast recovery
+	if (stage < m_rpgThreshold) { // fast recovery
 		FastRecoveryMlx(q);
-	} else if (q->mlx.m_rpTimeStage == m_rpgThreshold) { // active increase
+	} else if (stage == m_rpgThreshold) { // active increase
 		ActiveIncreaseMlx(q);
 	} else { // hyper increase
 		HyperIncreaseMlx(q);
+	}
+	// ePFC (ccMode=17)：CCF 设速窗口（2×RTT_internal）内增速钳制在 rv——防爬升兜底；
+	// 设速本体在 EpfcCcfRecv（m_rate = tgt = rv）；CNP 降速不受影响
+	if (m_cc_mode == 17 && q->m_epfcLimitUntil > Simulator::Now() && q->m_epfcLimitBps > 0) {
+		double cap = q->m_epfcLimitBps;
+		if (q->m_rate.GetBitRate() > cap)
+			q->m_rate = DataRate((uint64_t)cap);
+		if (q->mlx.m_targetRate.GetBitRate() > cap)
+			q->mlx.m_targetRate = DataRate((uint64_t)cap);
 	}
 }
 
@@ -1427,7 +1623,7 @@ void RdmaHw::HandleFrpFeedback(Ptr<RdmaQueuePair> qp, uint16_t fairRate, int16_t
 	double qDevBytes  = static_cast<double>(qDev) * 600.0;  // 600B Cell -> Byte (qDev is int16_t, can be negative)
 	double linkRateBps = static_cast<double>(linkRate) * 10000000.0;      // 10Mbps -> bps
 	double maxRateBps  = linkRateBps * 0.95;
-	double minRateBps  = 100.0 * 1000000.0;  // 100 Mbps
+	double minRateBps  = 100* 1000000.0;  // 100 Mbps
 	double T = 40e-6;         // 40微秒 = 0.00004秒
 
 	// 跟踪所有接收到的FRP的最小linkRate (静态变量，跨调用保持)
@@ -1471,7 +1667,7 @@ void RdmaHw::HandleFrpFeedback(Ptr<RdmaQueuePair> qp, uint16_t fairRate, int16_t
 		double deltaR = 1000.0 * 1000000.0;  // 1Gbps
 		double N = (fairRate > 0) ? (static_cast<double>(linkRate) / static_cast<double>(fairRate)) : 100.0;
 			if (N < 1.0) N = 1.0;
-			if (N > 100.0) N = 100.0;
+			if (N > 10.0) N = 10.0;
 		if (qDevBytes < qThBytes) {
 			// 策略1: 平滑调整
 			rBps = fairRateBps - qDevBytes / ( N * T ) * 8.0;
@@ -1479,7 +1675,7 @@ void RdmaHw::HandleFrpFeedback(Ptr<RdmaQueuePair> qp, uint16_t fairRate, int16_t
 		} else {
 			// 策略2: 基于公平速率的退避 r = max(F_min, F - gamma*qDev)
 			
-			double scaleFactor = 5.0;
+			double scaleFactor = 20.0;
 			double gamma = scaleFactor / N;
 			// gamma*qDev 在 600B Cell 单位下计算，再转为 bps
 			// r = F - gamma * qDev (qDev是cell数，gamma是无量纲，结果在10Mbps单位)

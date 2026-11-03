@@ -18,9 +18,9 @@ NS_LOG_COMPONENT_DEFINE("FrpRateCalculator");
 
 FrpRateCalculator::FrpRateCalculator() {
     // FRP算法参数
-    m_alpha = 0.2;
+    m_alpha = 0.125;
     m_beta = 0;
-    m_scaleFactor = 5.0;           // scaleFactor = 12 (端侧 rdma-hw.cc 策略2 同步使用 12.0)
+    m_scaleFactor = 20.0;           // scaleFactor = 12 (端侧 rdma-hw.cc 策略2 同步使用 12.0)
     m_tPeriodS = 40e-6;         // 40微秒 = 0.00004秒
     
 
@@ -44,7 +44,7 @@ double FrpRateCalculator::CalculateFairRate(uint32_t portId, uint64_t linkBps, u
 
     // 边界限制 (使用全局量纲 bps)
     double maxRateBps = linkBps * 0.95;
-    double minRateBps = 10.0 * 1000000000.0;  // 10 Gbps
+    double minRateBps = 100.0 * 1000000.0;  // 100Mbps
 
     // 初始化
     if (!state.isInitialized) {
@@ -110,7 +110,7 @@ double FrpRateCalculator::CalculateFairRate(uint32_t portId, uint64_t linkBps, u
         m_beta = 0.0;
         // FRP模式: 当队列超过q_th时计算lanbackoff
         if ((qCurCell - qRefCell) > qThCell) {
-            lanbackoff = m_scaleFactor * (qCurCell - qRefCell) * m_tPeriodS * k - qOldCell;
+             lanbackoff = m_scaleFactor * (qCurCell - qRefCell) * m_tPeriodS - qOldCell;
         }
         // 上游判断为"跨域流独占"时，抑制本地退避项
         if (consecutiveCrossDcTrigger >= 10) {
@@ -126,7 +126,7 @@ double FrpRateCalculator::CalculateFairRate(uint32_t portId, uint64_t linkBps, u
     } 
     // 4. 计算新的公平速率 (在10Mbps局部量纲下)
     // 公式: F_new = F_old - α*(q_cur - q_ref + lanbackoff) - β*(q_cur - q_old)
-    double alpha_term = m_alpha * (qCurCell - qRefCell + lanbackoff);
+     double alpha_term = m_alpha * (qCurCell - qOldCell);
     double beta_term = m_beta * (qCurCell - qOldCell);
     double fNew_10Mbps = fOld_10Mbps - alpha_term - beta_term;
 

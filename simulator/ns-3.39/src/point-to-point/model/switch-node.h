@@ -2,16 +2,35 @@
 #define SWITCH_NODE_H
 
 #include <unordered_map>
+#include <set>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
 #include "pint.h"
 #include "frp-rate-calculator.h"
 #include "ns3/atcGateway.h"
+#include "dci-ext.h"
+#include "epfc.h"
 
 namespace ns3 {
 
 class Packet;
+
+// ========== ATC Gateway 配置结构 ==========
+struct AtcConfig {
+    uint32_t voq_max_size = 0;
+    double cnp_notify_interval_us = 0.0;
+    std::string min_rate = "";
+    double rate_decrease_interval_us = 0.0;
+    double rpg_time_reset_us = 0.0;
+    bool cnp_on_global_congestion = false;
+    bool voq_react_to_cnp = false;
+    double voq_inflight_rtt_us = 0.0;
+    uint32_t max_voq_count = 0;
+    uint64_t max_voq_rate = 0;
+    uint64_t long_haul_bandwidth = 0;
+    Time long_haul_delay = MicroSeconds(0);
+};
 
 class SwitchNode : public Node{
 	static const uint32_t pCnt = 257;	// Number of ports used
@@ -45,6 +64,11 @@ protected:
 	uint32_t m_bifrostDeploySwitchId;   // Bifrost部署的交换机ID（从配置读取）
 	uint32_t m_bifrostLastPfcTimeUs;    // 上次PFC发送时间（微秒）
 	EventId m_bifrostPfcEvent;          // 周期性PFC事件
+
+	// ========== ATC (ccMode=15) Gateway 配置 ==========
+	AtcConfig m_atcConfig;              // ATC 配置参数
+	uint32_t m_gatewayType;             // Gateway 类型: 0=none, 1=source, 2=destination, 3=bidirectional
+	std::string m_configFilePath;       // 配置文件路径（用于读取算法参数）
 
 	// ========== 通用反馈包机制 ==========
 	bool m_switchFeedbackEnabled;      // 是否启用交换机反馈
@@ -97,6 +121,15 @@ public:
 	Ptr<SwitchMmu> m_mmu;
 	atcGateway m_atcGateway;
 
+	// ========== DCI-Ext (ccMode=16) 成员 ==========
+	DciExt m_dciExt;
+	bool m_dciExtEnabled;
+	std::set<uint32_t> m_pfcDisabledPorts;  // 禁用 PFC 发送的端口集合（DCI 长链路端口防死锁）
+
+	// ========== ePFC (ccMode=17) 成员 ==========
+	Epfc m_epfc;               // 三角色合一：打标 / 接收方DCI流表 / 出口端口门控
+	bool m_epfcEnabled;
+
 	static TypeId GetTypeId (void);
 	SwitchNode();
 	void SetEcmpSeed(uint32_t seed);
@@ -116,6 +149,29 @@ public:
 	void StartBifrostPfcMechanism();                                            // 启动Bifrost周期PFC机制
 	void SendBifrostPfcWithCustomTime();                                        // 发送带自定义暂停时间的PFC
 	uint32_t CalculateBifrostPauseTime(uint32_t qIndex, uint32_t qLenBytes, uint32_t r);  // 计算暂停时间（r=上一个周期收到的字节数）
+	void ReadBifrostConfigFromFile(const std::string& configFile);              // 从配置文件读取 Bifrost 参数
+	void InitializeBifrost(uint32_t switchId);                                  // 初始化 Bifrost（在 DCI 交换机上启用）
+
+	// ========== ATC (ccMode=15) Gateway 接口 ==========
+	void SetConfigFilePath(const std::string& configPath);                    // 设置配置文件路径
+	void ConfigureAtc(const AtcConfig& config);                                 // 配置 ATC 参数
+	void InitializeAtcGateway(uint32_t gatewayType);                            // 初始化 ATC Gateway (1=source, 2=destination, 3=bidirectional)
+	void ReadAtcConfigFromFile(const std::string& configFile);                  // 从配置文件读取 ATC 参数
+
+	// ========== DCI-Ext (ccMode=16) 接口 ==========
+	void InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
+	                      double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
+	                      uint32_t agingPeriods, bool senderSide = false,
+	                      double dtUs = 6.0, double sigmaUs = 3.0);   // 初始化 DCI-Ext v3（发送方表A/观察期/ECN反馈，接收方RTT探测+周期0xFA）
+	Ptr<NetDevice> GetDevByIndex(uint32_t ifIndex);                            // 端口设备查询（DCI-Ext NotifyDequeue 判长链路用）
+	void DisablePfcOnPort(uint32_t port);                                       // 禁用指定端口的 PFC 发送（DCI 长链路端口防死锁）
+
+	// ========== ePFC (ccMode=17) 接口 ==========
+	void InitializeEpfc(uint32_t nodeId, uint32_t ingressMulPct, uint64_t egressThreshBytes,
+	                    uint64_t dciThreshBytes, double rttUs, double agingRtts,
+	                    double updateTUs);   // 初始化 ePFC（ccMode=17 时所有交换机部署）
+	void EpfcGateHelper(uint32_t portIdx, uint8_t pg, bool on);  // ePFC 门控回调：本地门控指定端口（SetDciExtGate）
+	void EpfcDequeueHelper(uint32_t outPort, Ptr<Packet> p);  // ePFC 出队计量回调：读 Tag 调 DataDequeue（S 口径=物理发出）
 
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);

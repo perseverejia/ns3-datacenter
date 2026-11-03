@@ -31,6 +31,10 @@ public:
 	DataRate m_minRate;		//< Min sending rate
 	uint32_t m_mtu;
 	uint32_t m_cc_mode;
+	double m_epfcRttUs;  // ePFC (ccMode=17)：内部流 RTT（CCF 节流与 rv 采样窗口，us）
+	double m_epfcMaxPauseUs = 20; // ePFC：CCF 暂停时长上限（us），必须 < 内部流 RTT——
+	                              // 否则短 RTT 流的在途 ACK 会在暂停期内全部到齐，
+	                              // 暂停结束后无事件触发发送轮询 → 流饿死（实测 5→6 卡死）
 	double m_nack_interval;
 	uint32_t m_chunk;
 	uint32_t m_ack_interval;
@@ -62,6 +66,11 @@ public:
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
 	int ReceiveIcmp(Ptr<Packet> p, CustomHeader &ch); // handle ICMP packets
+	// ePFC (ccMode=17)：接收方收到标记包 → 节流生成 CCF 回发（五元组+rv+时间戳）
+	void EpfcCcfGen(Ptr<RdmaRxQueuePair> rxQp, CustomHeader &ch);
+	// ePFC (ccMode=17)：发送方收到 CCF → 暂停排空后按 rv 传输（暂停+2×RTT 为一个周期，周期内丢弃后续 CCF）
+	void EpfcCcfRecv(Ptr<Packet> p, CustomHeader &ch);
+	void SetEpfcRttUs(double us) { m_epfcRttUs = us; }
 	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
 
 	void CheckandSendQCN(Ptr<RdmaRxQueuePair> q);
@@ -93,6 +102,8 @@ public:
 	double m_rpgTimeReset;
 	double m_rateDecreaseInterval;
 	uint32_t m_rpgThreshold;
+	bool m_dcqcnByteRecoveryEnabled;
+	uint64_t m_dcqcnByteRecoveryThreshold;
 	double m_alpha_resume_interval;
 	DataRate m_rai;		//< Rate of additive increase
 	DataRate m_rhai;		//< Rate of hyper-additive increase
@@ -113,7 +124,8 @@ public:
 
 	// Mellanox's version of rate increase
 	void RateIncEventTimerMlx(Ptr<RdmaQueuePair> q);
-	void RateIncEventMlx(Ptr<RdmaQueuePair> q);
+	void RateIncByteCounterMlx(Ptr<RdmaQueuePair> q, uint32_t payloadBytes);
+	void RateIncEventMlx(Ptr<RdmaQueuePair> q, uint32_t stage);
 	void FastRecoveryMlx(Ptr<RdmaQueuePair> q);
 	void ActiveIncreaseMlx(Ptr<RdmaQueuePair> q);
 	void HyperIncreaseMlx(Ptr<RdmaQueuePair> q);

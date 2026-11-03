@@ -3,25 +3,30 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE examples/PowerTCP/topology.txt
-FLOW_FILE examples/PowerTCP/flow.txt
+TOPOLOGY_FILE examples/PowerTCP/topology-testbed.txt
+FLOW_FILE examples/PowerTCP/query-flow.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
 FCT_OUTPUT_TEMPLATE results/workload/fct/fct_{suffix}.txt
 PFC_OUTPUT_TEMPLATE results/workload/pfc/pfc_{suffix}.txt
 QUERY_FCT_OUTPUT_TEMPLATE results/workload/fct/query-flow-{suffix}.txt
 
-SIMULATOR_STOP_TIME 0.10
+SIMULATOR_STOP_TIME 2.0
 
 # ===== workload 参数=====
-CDF_FILE_NAME examples/PowerTCP/websearch.txt
-LOAD 0
+CDF_FILE_NAME examples/PowerTCP/Alistorage.txt
+LOAD 0.4
+LOAD_DC1 0.5    # -1: 镜像DC0(默认), 0: DC1无背景流, >0: DC1独立负载率
 START_TIME 0.005
-FLOW_LAUNCH_END_TIME 0.01
+FLOW_LAUNCH_END_TIME 0.1
 QUERY_REQUEST_RATE 0
 REQUEST_SIZE 0
 INCAST 5
 QUERY_FLOW_FILE examples/PowerTCP/query-flow.txt
+QUERY_AUTO_STOP 0
+
+# ===== 瓶颈队列监控 =====
+BOTTLENECK_MON_INTERVAL 40000
 
 # ===== 混合流量模式配置 =====
 ENABLE_FLOW_FILE_BACKGROUND 1
@@ -33,7 +38,9 @@ RATE_DECREASE_INTERVAL 4
 CLAMP_TARGET_RATE 0
 RP_TIMER 900
 EWMA_GAIN 0.00390625
-FAST_RECOVERY_TIMES 1
+FAST_RECOVERY_TIMES 5
+DCQCN_BYTE_RECOVERY_ENABLED 1
+DCQCN_BYTE_RECOVERY_THRESHOLD 153600
 RATE_AI 50Mb/s
 RATE_HAI 100Mb/s
 MIN_RATE 100Mb/s

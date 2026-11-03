@@ -145,6 +145,25 @@ public:
 
 	void SendPfc(uint32_t qIndex, uint32_t type); // type: 0 = pause, 1 = resume
 
+	// ========== 长链路（WAN）端口标志：由 workload 拓扑解析显式设置 ==========
+	// 真值来源 = topology 文件第 3 行的长链路编号列表（如 "14" = 第 14 条链路）；
+	// 取代各模块自判 channel delay > 100us 的旧方案（阈值去留由拓扑声明决定）
+	void SetWanPort(bool on) { m_wanPort = on; }
+	bool IsWanPort(void) const { return m_wanPort; }
+	bool m_wanPort;
+
+	// ========== DCI-Ext (ccMode=16): 本地端口门控（独立于 PFC m_paused） ==========
+	void SetDciExtGate(uint32_t qIndex, bool on);  // on=true 暂停受管数据 PG 出队
+	bool m_dciExtGated[qCnt];  // DCI-Ext 门控标志（默认全 false，惰性）
+
+	// ========== ePFC (ccMode=17): 实际出队时刻的 S 计量回调（SwitchNode 注入） ==========
+	// 出队点（TransmitStart 前）回调，使 DataDequeue 的 S 口径 = 物理发出字节；
+	// 门控中被拦的包不出队、不经过此处，天然不计 S
+	void SetEpfcDequeueCallback(Callback<void, uint32_t, Ptr<Packet>> cb) { m_epfcDequeueCb = cb; }
+	Callback<void, uint32_t, Ptr<Packet>> m_epfcDequeueCb;
+	void SetIgnoreReceivedPfc(bool on) { m_ignoreReceivedPfc = on; }  // 设置是否忽略收到的 PFC
+	bool m_ignoreReceivedPfc;  // 忽略收到的 PFC 帧（DCI 长链路端口防死锁）
+
 	// ========== Bifrost: 自定义暂停时间的PFC发送 ==========
 	void SendPfcWithTime(uint32_t qIndex, uint32_t type, uint32_t customTime);  // type: 0 = pause, 1 = resume
 

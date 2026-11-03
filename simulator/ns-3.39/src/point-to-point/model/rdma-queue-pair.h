@@ -30,6 +30,7 @@ public:
 	Time m_nextAvail;	//< Soonest time of next send
 	uint32_t wp; // current window of packets
 	uint32_t lastPktSize;
+	uint32_t lastPayloadSize;
 	Callback<void> m_notifyAppFinish;
 
 // vamsi
@@ -52,6 +53,9 @@ public:
 		EventId m_eventDecreaseRate;
 		bool m_decrease_cnp_arrived; // indicate if CNP arrived in the last slot
 		uint32_t m_rpTimeStage;
+		uint32_t m_rpCountStage;
+		uint64_t m_rpByteCount;
+		bool m_byteRecoveryActive;
 		EventId m_rpTimer;
 	} mlx;
 	struct {
@@ -121,6 +125,12 @@ public:
 		EventId m_eventId;
 	} txRate;
 
+	// ========== ePFC (ccMode=17)：发送方 CCF 设速状态 ==========
+	double m_epfcLimitBps;      // 最近一次 CCF 的 rv（设速本体在 EpfcCcfRecv：m_rate=tgt=rv；此值作窗口内防爬升钳制，bps）
+	Time m_epfcLimitUntil;      // 设速维持窗口截止时刻（暂停结束后再维持 2×RTT_internal；过期自动失效交回 DCQCN）
+	Time m_epfcPauseUntil;      // 排空暂停截止时刻：收到 CCF 先停发，排空超量在途后再按 rv 发送
+	                             //   暂停时长 Tp=(线速-rv)×RTT_internal/rv（多余在途量按 rv 排空所需时间）
+
 	/***********
 	 * methods
 	 **********/
@@ -163,6 +173,11 @@ public:
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	uint64_t m_recv_bytes; // 累计按序接收的 payload 字节数（用于接收侧 goodput 统计）
+	
+		// ePFC (ccMode=17)：CCF 节流与 rv 采样状态（接收方 host 侧）
+		Time m_epfcLastCcfTime;   // 上次 CCF 发出时刻（节流：每 RTT_internal 最多一个）
+		Time m_epfcSampleTime;    // rv 采样窗口起点
+		uint64_t m_epfcSampleBytes; // rv 采样窗口起点的累计接收字节
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();

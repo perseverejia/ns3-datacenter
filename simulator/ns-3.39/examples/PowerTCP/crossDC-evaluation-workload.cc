@@ -21,6 +21,7 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <set>
 #include <time.h>
 #include <algorithm>
 #include <cmath>
@@ -62,31 +63,21 @@ uint32_t cc_mode = 1;
 bool enable_qcn = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
+uint32_t query_auto_stop = 1;  // 1: 查询流完成后自动停止仿真, 0: 运行到 SIMULATOR_STOP_TIME
 std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
 bool enable_flow_file_background = true;
-std::string background_flow_file = "examples/PowerTCP/flow-background.txt";
+std::string background_flow_file = "examples/CrossDC-Algos/config/flows/flow-background.txt";
 
-// Bifrost (ccMode=12) 配置
-uint32_t bifrost_deploy_switch = 13;     // 默认部署在13号交换机
-uint32_t bifrost_pfc_period_us = 10;    // PFC发送周期（微秒）
 
-// ATC gateway 配置。ATC 使用 DCQCN 端侧调速，在 DCI 交换机启用 gateway。
-uint32_t gatewayFlag = 0; // 0: disabled, 2: ATC gateway
+// 只需要保留 gatewayNodeType 用于标识哪些交换机是 gateway
 unordered_map<uint32_t, int> gatewayNodeType; // 1: local/source DCI, 2: remote/destination DCI
-uint32_t max_voq_count = 128;
-uint64_t max_voq_rate = 100000000000ULL;
-uint32_t atc_voq_max_size = 10 * 1500;
-double atc_cnp_notify_interval_us = 4.0;
-std::string atc_min_rate = "100Mb/s";
-double atc_rate_decrease_interval_us = 4.0;
-double atc_rpg_time_reset_us = 480.0;
-bool atc_cnp_on_global_congestion = true;
-bool atc_voq_react_to_cnp = true;
-double atc_voq_inflight_rtt_us = 12.0;
-uint64_t longHaulBandwidth = 100000000000ULL;
-Time longHaulDelay = MicroSeconds(5000);
+uint32_t gatewayFlag = 0; // ATC gateway 类型标志
+
+// 长链路参数（用于 ATC Gateway 初始化）
+uint64_t longHaulBandwidth = 0;
+Time longHaulDelay = MicroSeconds(0);
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -122,6 +113,45 @@ uint64_t nic_delay_ns = 15000;  // 默认15μs = 15000ns
 uint32_t qlen_dump_interval = 100000000, qlen_mon_interval = 100;   
 uint64_t qlen_mon_start = 2000000000, qlen_mon_end = 2100000000;	
 string qlen_mon_file;
+
+// 瓶颈队列监控（每40us采样一次，记录全局队列最大的非DCI交换机）
+uint32_t bottleneck_mon_interval = 40000; // 40微秒 = 40000 ns timestep
+string bottleneck_mon_file;
+set<uint32_t> dci_switches; // DCI交换机ID集合（拓扑解析时动态填充）
+map<uint32_t, uint32_t> g_switchToDc; // 全局映射：交换机ID -> DC ID
+map<uint32_t, uint32_t> g_hostToDc;   // 全局映射：主机ID -> DC ID
+
+/**
+ * 统一的跨域流判断函数
+ * 根据源节点和目的节点的DC归属判断是否为跨域流
+ * @param srcId 源节点ID（主机或交换机）
+ * @param dstId 目的节点ID（主机或交换机）
+ * @return true 如果是跨域流，否则返回 false
+ */
+inline bool IsCrossDcFlow(uint32_t srcId, uint32_t dstId) {
+    uint32_t srcDc, dstDc;
+    bool srcFound = false, dstFound = false;
+    
+    // 尝试从 hostToDc 查找
+    if (g_hostToDc.find(srcId) != g_hostToDc.end()) {
+        srcDc = g_hostToDc[srcId];
+        srcFound = true;
+    } else if (g_switchToDc.find(srcId) != g_switchToDc.end()) {
+        srcDc = g_switchToDc[srcId];
+        srcFound = true;
+    }
+    
+    if (g_hostToDc.find(dstId) != g_hostToDc.end()) {
+        dstDc = g_hostToDc[dstId];
+        dstFound = true;
+    } else if (g_switchToDc.find(dstId) != g_switchToDc.end()) {
+        dstDc = g_switchToDc[dstId];
+        dstFound = true;
+    }
+    
+    // 如果都能找到且属于不同DC，则是跨域流
+    return (srcFound && dstFound && srcDc != dstDc);
+}
 
 unordered_map<uint64_t, uint32_t> rate2kmax, rate2kmin;
 unordered_map<uint64_t, double> rate2pmax;
@@ -275,19 +305,17 @@ void AutoAssignTopologyIps(NodeContainer &n) {
     }
     
     // ==================== 第2步: BFS 划分数据中心 (交换机) ====================
-    // Use >= because delay==threshold means it IS a cross-DC link
-    const uint64_t CROSS_DC_DELAY_THRESHOLD = 1000000; // 1ms
-    map<uint32_t, uint32_t> switchToDc;
+    // 使用 dci_switches 判断跨 DC 链路（从 topology 文件显式声明）
     map<uint32_t, bool> visited;
     uint32_t dcId = 0;
     
-    // Debug: print all inter-switch links with delays
+    // Debug: print all inter-switch links
     std::cout << "[TOPO BFS] Inter-switch links:" << std::endl;
     for (auto& link : interSwitchLinks) {
         std::cout << "  Switch " << link.first.first << " <-> Switch " << link.first.second
                   << " delay=" << link.second << "ns";
-        if (link.second >= CROSS_DC_DELAY_THRESHOLD) {
-            std::cout << " (CROSS-DC)";
+        if (dci_switches.count(link.first.first) > 0 && dci_switches.count(link.first.second) > 0) {
+            std::cout << " (CROSS-DC, DCI link)";
         }
         std::cout << std::endl;
     }
@@ -298,7 +326,7 @@ void AutoAssignTopologyIps(NodeContainer &n) {
         queue<uint32_t> q;
         q.push(swId);
         visited[swId] = true;
-        switchToDc[swId] = dcId;
+        g_switchToDc[swId] = dcId;
         
         while (!q.empty()) {
             uint32_t curr = q.front();
@@ -307,22 +335,22 @@ void AutoAssignTopologyIps(NodeContainer &n) {
             for (auto& link : interSwitchLinks) {
                 uint32_t src = link.first.first;
                 uint32_t dst = link.first.second;
-                uint64_t delay = link.second;
                 
                 uint32_t neighbor = 0;
                 if (src == curr) neighbor = dst;
                 else if (dst == curr) neighbor = src;
                 else continue;
                 
-                if (delay >= CROSS_DC_DELAY_THRESHOLD) {
+                // 使用 dci_switches 判断跨 DC 链路
+                if (dci_switches.count(src) > 0 && dci_switches.count(dst) > 0) {
                     std::cout << "[TOPO BFS] Cross-DC link skipped: " << src << " <-> " << dst
-                              << " delay=" << delay << "ns" << std::endl;
+                              << " (both are DCI switches)" << std::endl;
                     continue; // 跨DC链路，跳过
                 }
                 
                 if (!visited[neighbor]) {
                     visited[neighbor] = true;
-                    switchToDc[neighbor] = dcId;
+                    g_switchToDc[neighbor] = dcId;
                     q.push(neighbor);
                 }
             }
@@ -332,12 +360,11 @@ void AutoAssignTopologyIps(NodeContainer &n) {
     }
     
     std::cout << "[TOPO BFS] Total " << dcId << " datacenters discovered." << std::endl;
-    for (auto& kv : switchToDc) {
+    for (auto& kv : g_switchToDc) {
         std::cout << "  Switch " << kv.first << " -> DC" << kv.second << std::endl;
     }
     
     // ==================== 第3步: 发现主机所属的 DC ====================
-    map<uint32_t, uint32_t> hostToDc;
     for (uint32_t i = 0; i < n.GetN(); i++) {
         Ptr<Node> node = n.Get(i);
         if (node->GetNodeType() != 0) continue; // 0 = 主机
@@ -349,14 +376,14 @@ void AutoAssignTopologyIps(NodeContainer &n) {
             Ptr<Node> neighbor = it->first;
             if (neighbor->GetNodeType() == 1) { // 邻居是交换机
                 uint32_t swId = neighbor->GetId();
-                if (switchToDc.find(swId) != switchToDc.end()) {
-                    connectedDcs.insert(switchToDc[swId]);
+                if (g_switchToDc.find(swId) != g_switchToDc.end()) {
+                    connectedDcs.insert(g_switchToDc[swId]);
                 }
             }
         }
         
         if (!connectedDcs.empty()) {
-            hostToDc[hostId] = *connectedDcs.begin(); // 默认归属第一个发现的DC
+            g_hostToDc[hostId] = *connectedDcs.begin(); // 默认归属第一个发现的DC
         } else {
             std::cerr << "Warning: Host " << hostId << " not connected to any switch!" << std::endl;
         }
@@ -373,12 +400,12 @@ void AutoAssignTopologyIps(NodeContainer &n) {
         if (node->GetNodeType() == 1) { // 处理交换机
             Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(node);
             
-            if (switchToDc.find(nodeId) == switchToDc.end()) {
+            if (g_switchToDc.find(nodeId) == g_switchToDc.end()) {
                 std::cerr << "ERROR: Switch " << nodeId << " not assigned to any DC!" << std::endl;
                 continue;
             }
             
-            uint32_t assignedDcId = switchToDc[nodeId];
+            uint32_t assignedDcId = g_switchToDc[nodeId];
             
             // 在该DC内为交换机生成局部ID
             if (dcLocalIpCounter.find(assignedDcId) == dcLocalIpCounter.end()) {
@@ -397,9 +424,9 @@ void AutoAssignTopologyIps(NodeContainer &n) {
             ipToNodeIdMap[switchIp.Get()] = nodeId;
             
         } else if (node->GetNodeType() == 0) { // 处理主机
-            if (hostToDc.find(nodeId) == hostToDc.end()) continue;
+            if (g_hostToDc.find(nodeId) == g_hostToDc.end()) continue;
             
-            uint32_t assignedDcId = hostToDc[nodeId];
+            uint32_t assignedDcId = g_hostToDc[nodeId];
             
             if (dcLocalIpCounter.find(assignedDcId) == dcLocalIpCounter.end()) {
                 dcLocalIpCounter[assignedDcId] = 1;
@@ -415,7 +442,7 @@ void AutoAssignTopologyIps(NodeContainer &n) {
                 serverAddress[nodeId] = hostIp;
             }
             
-            // 【修复坑2】更新ns-3的Ipv4接口配置并显式激活接口
+            // 更新ns-3的Ipv4接口配置并显式激活接口
             Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
             std::cout << "  [DEBUG] Host " << nodeId << " nInterfaces=" << ipv4->GetNInterfaces() << std::endl;
             for (uint32_t ifIdx = 0; ifIdx < ipv4->GetNInterfaces(); ifIdx++) {
@@ -478,15 +505,8 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 	if (is_query && query_flow_info && g_queryFlowFctFile != nullptr) {
 		uint64_t fct_ns = (Simulator::Now() - q->startTime).GetTimeStep();
 		
-		// Check if cross-DC flow (one node in [0,52], other in [53,105])
-		bool cross_dc = false;
-		if ((sid <= 275 && did >= 277 && did <= 532) || (sid >= 277 && sid <= 532 && did <= 275)) {
-			cross_dc = true;
-			// Compensate for long-distance RTT (subtract 2 * long-distance delay)
-			if (g_longDistanceRtt > 0 && fct_ns > g_longDistanceRtt) {
-				fct_ns -= g_longDistanceRtt;
-			}
-		}
+		// Check if cross-DC flow using global topology mapping
+		bool cross_dc = IsCrossDcFlow(sid, did);
 		
 		// Output format: src_node dst_node pg dport flow_size start_time_ns fct_ns is_cross_dc
 		fprintf(g_queryFlowFctFile, "%u %u %lu %lu %lu %lu %lu %d\n",
@@ -508,7 +528,7 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 		          << " query flows at time " << Simulator::Now().GetSeconds() << "s" << std::endl;
 		
 		// Stop simulation when all query flows complete (with 1ms grace period)
-		if (g_queryFlowCompleted >= g_totalQueryFlows && !g_simulationStopped) {
+		if (query_auto_stop && g_queryFlowCompleted >= g_totalQueryFlows && !g_simulationStopped) {
 			g_simulationStopped = true;
 			std::cout << "[QUERY FLOW] All " << g_totalQueryFlows << " query flows completed! Stopping simulation..." << std::endl;
 			Simulator::Stop(Seconds(0.001)); // Stop after 1ms grace period
@@ -564,6 +584,40 @@ void monitor_buffer(FILE* qlen_output, NodeContainer *n) {
 	}
 	if (Simulator::Now().GetTimeStep() < qlen_mon_end)
 		Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer, qlen_output, n);
+}
+
+// 瓶颈队列监控：每 bottleneck_mon_interval 采样一次
+// 记录所有非DCI交换机中队列长度最大的那个交换机-端口对
+// 输出格式: 时间(ns) 交换机ID 端口号 队列长度(bytes)
+void monitor_bottleneck_queue(FILE* output, NodeContainer* n) {
+	uint32_t max_sw = 0, max_port = 0;
+	uint32_t max_q = 0;
+	
+	for (uint32_t i = 0; i < n->GetN(); i++) {
+		if (n->Get(i)->GetNodeType() != 1) continue; // 只处理交换机
+		if (dci_switches.count(i) > 0) continue;     // 跳过DCI交换机
+		
+		Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n->Get(i));
+		for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+			uint32_t qsize = 0;
+			for (uint32_t k = 0; k < SwitchMmu::qCnt; k++)
+				qsize += sw->m_mmu->egress_bytes[j][k];
+			if (qsize > max_q) {
+				max_q = qsize;
+				max_sw = i;
+				max_port = j;
+			}
+		}
+	}
+	
+	// 输出: 时间(ns) 交换机ID 端口号 队列长度(bytes)
+	fprintf(output, "%lu %u %u %u\n", 
+	        Simulator::Now().GetTimeStep(), max_sw, max_port, max_q);
+	fflush(output);
+	
+	// 递归调度
+	Simulator::Schedule(NanoSeconds(bottleneck_mon_interval), 
+	                   &monitor_bottleneck_queue, output, n);
 }
 
 void CalculateRoute(Ptr<Node> host) {
@@ -991,17 +1045,19 @@ void InstallBackgroundWorkload(double load,
 	double avgFlowSize = avg_cdf(cdfTable);
 	NS_ASSERT_MSG(avgFlowSize > 0, "Average CDF flow size must be positive");
 
-	// Separate hosts into two data centers
-	// DC0: nodes [0, 52], DC1: nodes [53, 105]
+	// Separate hosts into two data centers using global topology mapping
 	std::vector<uint32_t> dc0_hosts;
 	std::vector<uint32_t> dc1_hosts;
 	
 	for (uint32_t leafId : hostFacingLeafIds) {
 		auto &hosts = leafToHostIds[leafId];
 		for (uint32_t hostId : hosts) {
-			if (hostId <= 275) {
+			if (g_hostToDc.find(hostId) == g_hostToDc.end()) continue;
+			
+			uint32_t dcId = g_hostToDc[hostId];
+			if (dcId == 0) {
 				dc0_hosts.push_back(hostId);
-			} else if (hostId >= 277 && hostId <= 532) {
+			} else if (dcId == 1) {
 				dc1_hosts.push_back(hostId);
 			}
 		}
@@ -1023,8 +1079,12 @@ void InstallBackgroundWorkload(double load,
 	};
 	std::vector<BgFlowPattern> flowPatterns;
 	
-	std::cout << "[WORKLOAD DC0] Generating background flows for DC0 (nodes 0-52)" << std::endl;
-	double requestRate = load * 1e10 / (8.0 * avgFlowSize * numHostsPerDC);
+	std::cout << "[WORKLOAD DC0] Generating background flows for DC0 (PER_DC mode)" << std::endl;
+	// PER_DC 模式：每个 DC 的总负载为参考带宽的 load 倍
+	// 公式：λ_total = (ρ * C_ref) / (8 * E[S])
+	// 其中 ρ 是负载率，C_ref 是参考带宽（10 Gbps），E[S] 是平均流大小
+	// 每台主机的流到达率 = λ_total / numHostsPerDC
+	double requestRate = load * 1e10 / (8.0 * avgFlowSize * numHostsPerDC); // 每台主机的流到达率
 	
 	for (uint32_t i = 0; i < numHostsPerDC; i++) {
 		double startTime = START_TIME + poission_gen_interval(requestRate);
@@ -1073,6 +1133,7 @@ void InstallBackgroundWorkload(double load,
 }
 
 void InstallQueryFlowFile(const std::string& queryFlowFile,
+                          double startTime,
                           long& queryFlowCount,
                           long& totalQueryFlowSize)
 {
@@ -1099,9 +1160,9 @@ void InstallQueryFlowFile(const std::string& queryFlowFile,
 		uint32_t src, dst, pg;
 		uint16_t dport;
 		uint64_t flowSize;
-		double startTime;
+		double fileStartTime; // 文件中存储的startTime（作为相对偏移）
 		
-		qf >> src >> dst >> pg >> dport >> flowSize >> startTime;
+		qf >> src >> dst >> pg >> dport >> flowSize >> fileStartTime;
 		
 		// Validation
 		NS_ASSERT_MSG(src < n.GetN() && dst < n.GetN(), 
@@ -1111,18 +1172,11 @@ void InstallQueryFlowFile(const std::string& queryFlowFile,
 		NS_ASSERT_MSG(src != dst, "Query flow src and dst must differ");
 		NS_ASSERT_MSG(flowSize > 0, "Query flow size must be positive");
 		
-		// Check if this is a cross-DC flow
-		bool is_cross_dc = false;
-		if ((src <= 275 && dst >= 277 && dst <= 532) || (src >= 277 && src <= 532 && dst <= 275)) {
-			is_cross_dc = true;
-		}
+		// 直接使用文件中的时间作为启动时间（相对于 START_TIME 的偏移）
+		double adjustedStartTime = startTime + fileStartTime;
 		
-		// Adjust start time: cross-DC flows use original time, intra-DC flows add 1ms delay
-		double adjustedStartTime = startTime;
-		if (!is_cross_dc && g_longDistanceRtt > 0) {
-			// Add cross-DC delay (1ms one-way) for intra-DC flows
-			adjustedStartTime += (g_longDistanceRtt / 2.0) / 1e9;  // Convert ns to seconds
-		}
+		// Check if this is a cross-DC flow using global topology mapping
+		bool is_cross_dc = IsCrossDcFlow(src, dst);
 		
 		// Add flow with query flow flag and adjusted start time
 		AddWorkloadFlow(src, dst, pg, flowSize, adjustedStartTime,
@@ -1158,8 +1212,8 @@ int main(int argc, char *argv[])
 	clock_t begint, endt;
 	begint = clock();
 	std::ifstream conf;
-	bool wien = true; // wien enables PowerTCP. 
-	bool delayWien = false; // delayWien enables Theta-PowerTCP (delaypowertcp) 
+	bool wien = false; // PowerTCP 启用标志（ccMode=4 时自动启用）
+	bool delayWien = false; // Theta-PowerTCP 启用标志 
 
 	uint32_t SERVER_COUNT = 0;
 	uint32_t LEAF_COUNT = 0;
@@ -1170,14 +1224,14 @@ int main(int argc, char *argv[])
 	double FLOW_LAUNCH_END_TIME = 0.045;
 	double load = 0.2;
 	unsigned randomSeed = 7;
-	std::string queryFlowFile = "examples/PowerTCP/query-flow.txt";
+	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow.txt";
 	std::string queryFlowFctFile = "";  // Will be set via command line
 
 	uint32_t algorithm = 3;
 	uint32_t windowCheck = 1;
 	uint32_t gatewayTypeOverride = UINT32_MAX;
-	std::string confFile = "examples/PowerTCP/config-workload.txt";
-	std::string cdfFileName = "examples/PowerTCP/Alistorage.txt";
+	std::string confFile = "examples/CrossDC-Algos/config/workload/config-workload.txt";
+	std::string cdfFileName = "examples/CrossDC-Algos/config/workload/Alistorage.txt";
 	
 	CommandLine cmd;
 	cmd.AddValue("conf", "config file path", confFile);
@@ -1376,15 +1430,20 @@ int main(int argc, char *argv[])
 			conf >> cc_mode;
 			std::cout << "CC_MODE\t\t" << cc_mode << '\n';
 		}
-		// Bifrost配置解析
-		else if (key.compare("BIFROST_DEPLOY_SWITCH") == 0) {
-			conf >> bifrost_deploy_switch;
-			std::cout << "BIFROST_DEPLOY_SWITCH\t\t" << bifrost_deploy_switch << '\n';
+		else if (key.compare("POWERTCP_ENABLED") == 0) {
+			uint32_t v;
+			conf >> v;
+			wien = (v != 0);
+			std::cout << "POWERTCP_ENABLED\t\t" << (wien ? 1 : 0) << "\n";
 		}
-		else if (key.compare("BIFROST_PFC_PERIOD") == 0) {
-			conf >> bifrost_pfc_period_us;
-			std::cout << "BIFROST_PFC_PERIOD\t\t" << bifrost_pfc_period_us << "us\n";
-		} else if (key.compare("GATEWAY_TYPE") == 0) {
+		else if (key.compare("POWERTCP_DELAY") == 0) {
+			uint32_t v;
+			conf >> v;
+			delayWien = (v != 0);
+			std::cout << "POWERTCP_DELAY\t\t\t" << (delayWien ? 1 : 0) << "\n";
+		}
+
+		else if (key.compare("GATEWAY_TYPE") == 0) {
 			conf >> gatewayFlag;
 			std::cout << "GATEWAY_TYPE		" << gatewayFlag << "\n";
 		} else if (key.compare("GATEWAY_SRC") == 0) {
@@ -1411,40 +1470,7 @@ int main(int argc, char *argv[])
 				std::cout << ' ' << nodeId;
 			}
 			std::cout << '\n';
-		} else if (key.compare("MAX_ATC_VOQ_COUNT") == 0) {
-			conf >> max_voq_count;
-			std::cout << "MAX_ATC_VOQ_COUNT		" << max_voq_count << "\n";
-		} else if (key.compare("MAX_ATC_VOQ_RATE") == 0) {
-			conf >> max_voq_rate;
-			std::cout << "MAX_ATC_VOQ_RATE		" << max_voq_rate << "\n";
-		} else if (key.compare("ATC_VOQ_MAX_SIZE") == 0) {
-			conf >> atc_voq_max_size;
-			std::cout << "ATC_VOQ_MAX_SIZE		" << atc_voq_max_size << "\n";
-		} else if (key.compare("ATC_CNP_NOTIFY_INTERVAL") == 0) {
-			conf >> atc_cnp_notify_interval_us;
-			std::cout << "ATC_CNP_NOTIFY_INTERVAL	" << atc_cnp_notify_interval_us << "us\n";
-		} else if (key.compare("ATC_MIN_RATE") == 0) {
-			conf >> atc_min_rate;
-			std::cout << "ATC_MIN_RATE		" << atc_min_rate << "\n";
-		} else if (key.compare("ATC_RATE_DECREASE_INTERVAL") == 0) {
-			conf >> atc_rate_decrease_interval_us;
-			std::cout << "ATC_RATE_DECREASE_INTERVAL	" << atc_rate_decrease_interval_us << "us\n";
-		} else if (key.compare("ATC_RPG_TIME_RESET") == 0) {
-			conf >> atc_rpg_time_reset_us;
-			std::cout << "ATC_RPG_TIME_RESET		" << atc_rpg_time_reset_us << "us\n";
-		} else if (key.compare("ATC_CNP_ON_GLOBAL_CONGESTION") == 0) {
-			uint32_t v;
-			conf >> v;
-			atc_cnp_on_global_congestion = (v != 0);
-			std::cout << "ATC_CNP_ON_GLOBAL_CONGESTION	" << (atc_cnp_on_global_congestion ? 1 : 0) << "\n";
-		} else if (key.compare("ATC_VOQ_REACT_TO_CNP") == 0) {
-			uint32_t v;
-			conf >> v;
-			atc_voq_react_to_cnp = (v != 0);
-			std::cout << "ATC_VOQ_REACT_TO_CNP		" << (atc_voq_react_to_cnp ? 1 : 0) << "\n";
-		} else if (key.compare("ATC_VOQ_INFLIGHT_RTT_US") == 0) {
-			conf >> atc_voq_inflight_rtt_us;
-			std::cout << "ATC_VOQ_INFLIGHT_RTT_US	" << atc_voq_inflight_rtt_us << "us\n";
+			
 		} else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
 			double v;
 			conf >> v;
@@ -1549,6 +1575,12 @@ int main(int argc, char *argv[])
 		} else if (key.compare("QLEN_MON_END") == 0) {
 			conf >> qlen_mon_end;
 			std::cout << "QLEN_MON_END\t\t\t\t" << qlen_mon_end << '\n';
+		} else if (key.compare("BOTTLENECK_MON_FILE") == 0) {
+			conf >> bottleneck_mon_file;
+			std::cout << "BOTTLENECK_MON_FILE\t\t" << bottleneck_mon_file << '\n';
+		} else if (key.compare("BOTTLENECK_MON_INTERVAL") == 0) {
+			conf >> bottleneck_mon_interval;
+			std::cout << "BOTTLENECK_MON_INTERVAL\t" << bottleneck_mon_interval << " ns\n";
 		} else if (key.compare("MULTI_RATE") == 0) {
 			int v;
 			conf >> v;
@@ -1592,6 +1624,10 @@ int main(int argc, char *argv[])
 			conf >> queryFlowFile;
 			std::cout << "QUERY_FLOW_FILE		" << queryFlowFile << '\n';
 		}
+		else if (key.compare("QUERY_AUTO_STOP") == 0) {
+			conf >> query_auto_stop;
+			std::cout << "QUERY_AUTO_STOP		" << query_auto_stop << '\n';
+		}
 		else if (key.compare("ENABLE_FLOW_FILE_BACKGROUND") == 0) {
 			uint32_t v;
 			conf >> v;
@@ -1630,6 +1666,12 @@ int main(int argc, char *argv[])
 	has_win = windowCheck; // overrides configuration file
 	var_win = windowCheck; // overrides configuration file
 	
+	// PowerTCP (ccMode=4): 自动启用
+	if (cc_mode == 4) {
+		wien = true; // 自动启用 PowerTCP
+		std::cout << "[POWERTCP] ccMode=4 detected, automatically enabled PowerTCP" << std::endl;
+	}
+	
 
 	// workload parameters are owned by config-workload.txt.
 	//simulator_stop_time = END_TIME;
@@ -1647,7 +1689,7 @@ int main(int argc, char *argv[])
 	// IntHeader::mode
 	if (cc_mode == 7) // timely, use ts
 		IntHeader::mode = IntHeader::TS;
-	else if (cc_mode == 3) // hpcc, powertcp, use int
+	else if (cc_mode == 3 || cc_mode == 4) // hpcc (3) or powertcp (4), use int
 		IntHeader::mode = IntHeader::NORMAL;
 	else if (cc_mode == 10) // hpcc-pint
 		IntHeader::mode = IntHeader::PINT;
@@ -1662,62 +1704,22 @@ int main(int argc, char *argv[])
 
 	topof.open(topology_file.c_str());
 	uint32_t node_num, switch_num, tors, link_num, trace_num;
-	topof >> node_num >> switch_num >> tors >> link_num; // changed here. The previous order was node, switch, link // tors is not used. switch_num=tors for now.
+	uint32_t long_link_count = 0; // 长链路数目
+	topof >> node_num >> switch_num >> tors >> link_num >> long_link_count; // 读取长链路数目
 	tors = switch_num;
-	std::cout << node_num << " " << switch_num << " " << tors <<  " " << link_num << std::endl;
+	std::cout << node_num << " " << switch_num << " " << tors <<  " " << link_num << " " << long_link_count << std::endl;
 	flow_num = 0;
 	
-	// Read topology to find long-distance RTT (between DC0 and DC1)
-	// Look for link between node 52 and 105 (or similar cross-DC links)
-	std::ifstream topo_copy(topology_file.c_str());
-	if (topo_copy.is_open()) {
-		uint32_t n1, n2;
-		double bw;
-		std::string delay_str;
-		uint32_t dummy;
-		// Skip header
-		topo_copy >> n1; // node_num
-		topo_copy >> n1; // switch_num
-		topo_copy >> n1; // tors
-		topo_copy >> n1; // link_num
-		// Skip switch IDs
-		for (uint32_t i = 0; i < switch_num; i++) {
-			topo_copy >> n1;
-		}
-		// Read links to find cross-DC link (52-105 or similar)
-		while (topo_copy >> n1 >> n2 >> bw >> delay_str >> dummy) {
-			// Parse delay string (e.g., "1.5us", "0.5ms")
-			double delay_ns = 0;
-			if (delay_str.find("us") != std::string::npos) {
-				delay_ns = std::stod(delay_str) * 1000;  // Convert us to ns
-			} else if (delay_str.find("ms") != std::string::npos) {
-				delay_ns = std::stod(delay_str) * 1000000;  // Convert ms to ns
-			} else if (delay_str.find("ns") != std::string::npos) {
-				delay_ns = std::stod(delay_str);
-			} else {
-				delay_ns = std::stod(delay_str);  // Assume ns if no unit
-			}
-			
-			// Check if this is a cross-DC link (one endpoint in [0,52], other in [53,105])
-			bool is_cross_dc = false;
-			if ((n1 <= 275 && n2 >= 277 && n2 <= 532) || (n1 >= 277 && n1 <= 532 && n2 <= 275)) {
-				is_cross_dc = true;
-			}
-			// Also check if delay is significantly larger (0.5ms vs 1.5us)
-			if (delay_ns > 100000) { // > 0.1ms (100000 ns)
-				g_longDistanceRtt = static_cast<uint64_t>(delay_ns * 2); // RTT = 2 * one-way delay
-				std::cout << "[TOPOLOGY] Found long-distance link: " << n1 << " <-> " << n2 
-				          << " delay=" << delay_str << " (" << delay_ns << "ns) RTT=" << g_longDistanceRtt << "ns" << std::endl;
-				break;
-			}
-		}
-		topo_copy.close();
+	// Read long-distance link indices
+	std::set<uint32_t> long_link_indices;
+	for (uint32_t i = 0; i < long_link_count; i++) {
+		uint32_t link_idx;
+		topof >> link_idx;
+		long_link_indices.insert(link_idx);
+		std::cout << "[TOPOLOGY] Long-distance link index: " << link_idx << std::endl;
 	}
-	if (g_longDistanceRtt == 0) {
-		std::cout << "[TOPOLOGY] Warning: Long-distance RTT not found, using default 0" << std::endl;
-	} else {
-		std::cout << "[TOPOLOGY] Long-distance RTT set to: " << g_longDistanceRtt << " ns (" << g_longDistanceRtt / 1000000.0 << " ms)" << std::endl;
-	}
+	
+	// Long-distance RTT will be set during link parsing below
 
 	NodeContainer serverNodes;
 	NodeContainer torNodes;
@@ -1811,14 +1813,30 @@ int main(int argc, char *argv[])
 		std::cout << src << " " << dst << " " << n.GetN() << " " << data_rate << " " << link_delay << " " << error_rate << std::endl;
 		Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
 
-		if (gatewayNodeType.find(src) != gatewayNodeType.end() &&
-			gatewayNodeType.find(dst) != gatewayNodeType.end())
-		{
+		// Check if this is a long-distance link (from topology file)
+		if (long_link_indices.count(i) > 0) {
+			// Mark both endpoints as DCI switches
+			dci_switches.insert(src);
+			dci_switches.insert(dst);
+			
+			// Parse delay to calculate RTT
+			double delay_ns = 0;
+			if (link_delay.find("us") != std::string::npos) {
+				delay_ns = std::stod(link_delay) * 1000;
+			} else if (link_delay.find("ms") != std::string::npos) {
+				delay_ns = std::stod(link_delay) * 1000000;
+			} else if (link_delay.find("ns") != std::string::npos) {
+				delay_ns = std::stod(link_delay);
+			} else {
+				delay_ns = std::stod(link_delay);
+			}
+			g_longDistanceRtt = static_cast<uint64_t>(delay_ns * 2);
 			longHaulBandwidth = DataRate(data_rate).GetBitRate();
 			longHaulDelay = Time(link_delay);
-			std::cout << "[ATC] long-haul link " << src << "<->" << dst
-			          << " bandwidth=" << longHaulBandwidth
-			          << " delay=" << longHaulDelay.GetTimeStep() << " timestep\n";
+			
+			std::cout << "[TOPOLOGY] Long-distance link #" << i << ": " << src << " <-> " << dst
+			          << " delay=" << link_delay << " RTT=" << g_longDistanceRtt << "ns" << std::endl;
+			std::cout << "[TOPOLOGY] DCI switches: " << src << ", " << dst << std::endl;
 		}
 
 		qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
@@ -1883,7 +1901,7 @@ int main(int argc, char *argv[])
 		ipv4.Assign(d);
 
 		// used to create a graph of the topology
-		// 【修复坑1】必须在ipv4.Assign(d)之后调用GetInterfaceForDevice
+		// 必须在ipv4.Assign(d)之后调用GetInterfaceForDevice
 		// 因为Assign才会把NetDevice注册到Ipv4协议栈，之前GetInterfaceForDevice返回-1
 		Ptr<Ipv4> sIpv4 = snode->GetObject<Ipv4>();
 		Ptr<Ipv4> dIpv4 = dnode->GetObject<Ipv4>();
@@ -1913,13 +1931,7 @@ int main(int argc, char *argv[])
 			sw->m_mmu->SetAlphaIngress(alpha);
 			sw->m_mmu->SetAlphaEgress(UINT16_MAX);
 
-			bool isDciSwitch = false;
-			for (auto it = nbr2if[sw].begin(); it != nbr2if[sw].end(); it++) {
-				if (it->second.up && it->second.delay > 100000) { // long-distance link (>0.1ms)
-					isDciSwitch = true;
-					break;
-				}
-			}
+			bool isDciSwitch = (dci_switches.count(i) > 0); // Use DCI switch set from topology
 			uint32_t headroomMultiplier = isDciSwitch ? 3 : 20;
 
 			uint64_t totalHeadroom = 0;
@@ -1947,52 +1959,17 @@ int main(int argc, char *argv[])
 			sw->m_mmu->SetEgressLosslessPool(buffer_size * 1024 * 1024);
 			sw->m_mmu->node_id = sw->GetId();
 
-			if (gatewayFlag == 2) {
+			// ATC (ccMode=15): 设置 Gateway 类型，SwitchNode 会自动初始化
+			if (cc_mode == 15) {
+				// 设置配置文件路径
+				sw->SetConfigFilePath(confFile);
+				
 				auto gatewayIt = gatewayNodeType.find(i);
 				if (gatewayIt != gatewayNodeType.end()) {
-					if (gatewayIt->second == 1) {
-						sw->m_atcGateway.ConfigureAtcParams(atc_voq_max_size, atc_cnp_notify_interval_us, atc_min_rate, atc_rate_decrease_interval_us, atc_rpg_time_reset_us, atc_cnp_on_global_congestion, atc_voq_react_to_cnp, atc_voq_inflight_rtt_us);
-						sw->m_atcGateway.init(1, max_voq_count, max_voq_rate, longHaulBandwidth, longHaulDelay);
-						std::cout << "[ATC] Initialized source gateway switch " << i << std::endl;
-					}
-					else if (gatewayIt->second == 2) {
-						sw->m_atcGateway.ConfigureAtcParams(atc_voq_max_size, atc_cnp_notify_interval_us, atc_min_rate, atc_rate_decrease_interval_us, atc_rpg_time_reset_us, atc_cnp_on_global_congestion, atc_voq_react_to_cnp, atc_voq_inflight_rtt_us);
-						sw->m_atcGateway.init(2, max_voq_count, max_voq_rate, longHaulBandwidth, longHaulDelay);
-						std::cout << "[ATC] Initialized destination gateway switch " << i << std::endl;
-					}
-					else if (gatewayIt->second == 3) {
-						sw->m_atcGateway.ConfigureAtcParams(atc_voq_max_size, atc_cnp_notify_interval_us, atc_min_rate, atc_rate_decrease_interval_us, atc_rpg_time_reset_us, atc_cnp_on_global_congestion, atc_voq_react_to_cnp, atc_voq_inflight_rtt_us);
-						sw->m_atcGateway.init(1, max_voq_count, max_voq_rate, longHaulBandwidth, longHaulDelay);
-						sw->m_atcGateway.init(2, max_voq_count, max_voq_rate, longHaulBandwidth, longHaulDelay);
-						std::cout << "[ATC] Initialized bidirectional gateway switch " << i << std::endl;
-					}
-				}
-			}
-
-			// ========== SW93 port 1 (接 SW85→host53) PFC特殊配置 ==========
-			// 原因: 默认 threshold=2.25MB (alpha=1/8) + headroom=BDP×3=37.5KB 过小
-			//       导致队列可以推到7MB+才丢包。改为2MB+100KB+100ms。
-			if (sw->GetId() == 93) {
-				const uint32_t HOST_PORT = 1;     // SW93 port1 = SW85 (接 host53)
-				const uint32_t PFC_PG    = 1;     // host 流量所在 PG
-				const uint32_t TWO_MB    = 2 * 1024 * 1024;
-				const uint32_t HEADROOM  = 100 * 1024;  // 2MB 阈值后再绥冲 100KB
-				const uint32_t XON_BYTES = 256 * 1024;  // 队列跌到 256KB 以下才 resume
-
-				// 设 alphaIngress 使 threshold≈2MB (18MB pool × 2/18 ≈ 2MB)
-				sw->m_mmu->SetAlphaIngress(2.0 / 18.0, HOST_PORT, PFC_PG);
-				// 同步设 headroom (2MB阈值后允许多绥100KB)
-				sw->m_mmu->SetHeadroom(HEADROOM, HOST_PORT, PFC_PG);
-				// 调高 resume 阈值避免频繁 resume/pause 振荡
-				sw->m_mmu->SetXon(XON_BYTES, HOST_PORT, PFC_PG);
-				sw->m_mmu->SetXonOffset(XON_BYTES, HOST_PORT, PFC_PG);
-				std::cout << "[PFC] SW93 port 1: threshold=2MB, headroom="
-				          << HEADROOM << "B, xon=" << XON_BYTES << "B" << std::endl;
-
-				// 同时调高 PauseTime：默认5μs太短，跨域RTT≈1ms+，不够上游响应
-				for (uint32_t k = 1; k < sw->GetNDevices(); k++) {
-					Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(k));
-					dev->SetAttribute("PauseTime", UintegerValue(100000));  // 100ms
+					// 设置 Gateway 类型并初始化
+					sw->SetAttribute("GatewayType", UintegerValue(gatewayIt->second));
+					sw->ReadAtcConfigFromFile(confFile);
+					sw->InitializeAtcGateway(gatewayIt->second);
 				}
 			}
 		}
@@ -2009,7 +1986,8 @@ int main(int argc, char *argv[])
 			if (algorithm == 13) algo_suffix = "frp";
 			else if (algorithm == 14) algo_suffix = "rocc";
 			else if (algorithm == 1) algo_suffix = "dcqcn";  // DCQCN is ccMode=1
-			else if (algorithm == 3) algo_suffix = "hpcc";  // PowerInt/HPCC/PowerDelay use ccMode=3
+			else if (algorithm == 3) algo_suffix = "hpcc";  // HPCC uses ccMode=3
+			else if (algorithm == 4) algo_suffix = "powertcp";  // PowerTCP uses ccMode=4
 		
 			else if (algorithm == 7) algo_suffix = "timely";  // Timely is ccMode=7
 			else if (algorithm == 10) algo_suffix = "dctcp";
@@ -2023,7 +2001,7 @@ int main(int argc, char *argv[])
 			// Write header comment
 			fprintf(g_queryFlowFctFile, "# Query Flow FCT Results\n");
 			fprintf(g_queryFlowFctFile, "# Format: src_node dst_node pg dport flow_size(B) start_time(ns) fct(ns) is_cross_dc\n");
-			fprintf(g_queryFlowFctFile, "# Note: FCT is compensated for cross-DC flows (subtracts long-distance RTT)\n");
+			fprintf(g_queryFlowFctFile, "# Note: FCT is raw (no compensation) for all flows\n");
 			fflush(g_queryFlowFctFile);
 		} else {
 			std::cerr << "Warning: Cannot open query flow FCT file: " << queryFlowFctFile << std::endl;
@@ -2232,19 +2210,17 @@ int main(int argc, char *argv[])
 		if (n.Get(i)->GetNodeType()) { // switch
 			Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
 
-			// Bifrost (ccMode=12): 只在13号交换机上启用周期PFC机制，其他交换机使用ccMode=1 (DCQCN)
-			if (cc_mode == 12 ) {
-				if( i == bifrost_deploy_switch){
-					std::cout << "[BIFROST] Enabling Bifrost on switch " << i
-					          << " (cc_mode=" << cc_mode << ")" << std::endl;
-					sw->SetAttribute("CcMode", UintegerValue(12));
-					sw->SetAttribute("BifrostEnabled", BooleanValue(true));
-					sw->SetAttribute("BifrostPfcPeriodUs", UintegerValue(bifrost_pfc_period_us));
-					sw->SetAttribute("BifrostDeploySwitchId", UintegerValue(bifrost_deploy_switch));
-					sw->StartBifrostPfcMechanism();
-				}
-				else {
-					sw->SetAttribute("CcMode", UintegerValue(1));
+			// Bifrost (ccMode=12): 在所有DCI交换机上启用周期PFC机制，其他交换机使用ccMode=1 (DCQCN)
+
+
+
+			if (cc_mode == 12) {
+				if (dci_switches.count(i) > 0) {
+					// 从配置文件读取 Bifrost 参数并初始化
+					sw->ReadBifrostConfigFromFile(confFile);
+					sw->InitializeBifrost(i);
+				} else {
+					sw->SetAttribute("CcMode", UintegerValue(1)); // 非 DCI 交换机回退到 DCQCN
 				}
 			} else {
 				// ccMode != 12 时，设置所有交换机为cc_mode
@@ -2286,21 +2262,15 @@ int main(int argc, char *argv[])
 	          << " entries " << cdfTable->num_entry
 	          << " avgFlowSize " << avg_cdf(cdfTable) << std::endl;
 
+	// 背景流已删除，只保留查询流
 	long flowCount = 0;
 	long totalFlowSize = 0;
-	if (enable_flow_file_background) {
-		InstallBackgroundWorkload(load, cdfTable, START_TIME, FLOW_LAUNCH_END_TIME, flowCount, totalFlowSize);
-	} else {
-		std::cout << "[BACKGROUND] Background workload disabled by config" << std::endl;
-	}
-	std::cout << "[BACKGROUND] Total background flows: " << flowCount << std::endl;
-	if (flowCount > 0)
-		std::cout << "[BACKGROUND] Average flow size: " << static_cast<double>(totalFlowSize) / flowCount << " bytes" << std::endl;
+	std::cout << "[BACKGROUND] Background workload disabled (only query flows enabled)" << std::endl;
 
 	// 生成查询流（文件）
 	long queryFlowCount = 0;
 	long totalQueryFlowSize = 0;
-	InstallQueryFlowFile(queryFlowFile, queryFlowCount, totalQueryFlowSize);
+	InstallQueryFlowFile(queryFlowFile, START_TIME, queryFlowCount, totalQueryFlowSize);
 	std::cout << "[WORKLOAD] Total flows: " << flows.size() << std::endl;
 
 	topof.close();
@@ -2312,6 +2282,53 @@ int main(int argc, char *argv[])
 
 	// AsciiTraceHelper ascii;
 	//     qbb.EnableAsciiAll (ascii.CreateFileStream ("eval.tr"));
+	
+	// 自动生成瓶颈队列监控文件名（如果未手动指定）
+	if (bottleneck_mon_file.empty()) {
+		// 提取CDF名称（如 websearch, alistorage）
+		std::string cdf_base = cdfFileName;
+		size_t slash_pos = cdf_base.rfind('/');
+		if (slash_pos != std::string::npos) cdf_base = cdf_base.substr(slash_pos + 1);
+		size_t dot_pos = cdf_base.rfind('.');
+		if (dot_pos != std::string::npos) cdf_base = cdf_base.substr(0, dot_pos);
+		// 转小写
+		std::transform(cdf_base.begin(), cdf_base.end(), cdf_base.begin(), ::tolower);
+		
+		// 算法名称（ATC特殊处理：algorithm=1 + gatewayFlag=2）
+		std::string algo_name;
+		if (algorithm == 13) algo_name = "frp";
+		else if (algorithm == 14) algo_name = "rocc";
+		else if (algorithm == 1 && gatewayFlag == 2) algo_name = "atc";
+		else if (algorithm == 1) algo_name = "dcqcn";
+		else if (algorithm == 3) algo_name = "hpcc";
+		else if (algorithm == 4) algo_name = "powertcp";
+		else if (algorithm == 7) algo_name = "timely";
+		else if (algorithm == 15) algo_name = "atc";
+		else algo_name = "unknown";
+		
+		// 构建文件名: bottleneck_{algo}_{cdf}_load{load}.txt
+		char load_str[32];
+		snprintf(load_str, sizeof(load_str), "%.2f", load);
+		bottleneck_mon_file = "/home/gj/ns3/results/workload/bottleneck_queue_length/bottleneck_" 
+		                      + algo_name + "_" + cdf_base + "_load" + load_str + ".txt";
+	}
+	
+	// 启动瓶颈队列监控
+	if (!bottleneck_mon_file.empty()) {
+		// 确保输出目录存在
+		system("mkdir -p /home/gj/ns3/results/workload/bottleneck_queue_length");
+		
+		FILE* bn_fp = fopen(bottleneck_mon_file.c_str(), "w");
+		if (bn_fp) {
+			std::cout << "[BOTTLENECK MON] Enabled, interval=" << bottleneck_mon_interval 
+			          << "ns, output=" << bottleneck_mon_file << std::endl;
+			Simulator::Schedule(NanoSeconds(bottleneck_mon_interval), 
+			                   &monitor_bottleneck_queue, bn_fp, &n);
+		} else {
+			std::cerr << "Warning: Cannot open bottleneck monitor file: " << bottleneck_mon_file << std::endl;
+		}
+	}
+	
 	std::cout << "Running Simulation.\n";
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));

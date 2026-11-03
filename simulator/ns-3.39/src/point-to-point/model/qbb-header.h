@@ -40,6 +40,7 @@ public:
   void SetDport(uint32_t _dport);
   void SetTs(uint64_t ts);
   void SetCnp();
+  void ClearCnp();   // DCI-Ext: 清除 CNP 位（CNP 生成权垄断用）
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
