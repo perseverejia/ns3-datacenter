@@ -39,6 +39,12 @@ void DciExt::Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodT
     if (!m_senderSide && m_periodT > Seconds(0))
         m_periodEvent = Simulator::Schedule(m_periodT, &DciExt::PeriodicTick, this);
     m_sndTickEvent = EventId();
+	m_sndTickPeriod = m_periodT; // 压制周期默认跟随 T; 可被 SetSndTickUs 覆盖
+}
+
+void DciExt::SetSndTickUs(double us) {
+	if (us > 0)
+		m_sndTickPeriod = MicroSeconds(us);
 }
 
 void DciExt::SetSendCallback(Callback<void, Ptr<Packet>, CustomHeader&> cb) {
@@ -77,26 +83,20 @@ bool DciExt::IsLongLinkPort(Ptr<NetDevice> dev) const {
 //   实际 g=1/256 下 M[40]≈0.72，与旧表 0.66 同量级（旧表公式本身基本正确）
 // ---------------------------------------------------------------------------
 void DciExt::BuildTable() {
-    const double g = 1.0 / 256.0;  // EWMA_GAIN（config L51，运行日志验证生效值）
-    const uint32_t cutUs = 4;      // RATE_DECREASE_INTERVAL（us）
-    m_M[0] = 1.0;                  // 0 个 CNP：不降速
+    // v4 表模型：静默 400us 后 α 从 1 衰减到 (255/256)^400 ≈ 0.209 → α₀=0.2 起步；
+    // CNP 每 4us 一个（与刀消费 4us 对齐）；α 每 1us 更新：
+    //   到达的 1us  α <- (1-g)α + g，随后 3us x(1-g)^3；
+    // 每 4us 末消费一刀 m *= (1 - α/2)（单刀约 -10%，n 刀合成见表）
+    const double g = 1.0 / 256.0;      // EWMA_GAIN（必须与端侧 config EWMA_GAIN 一致）
+    const double alpha0 = 0.2;         // 静默 400us 后的起步 α
+    m_M[0] = 1.0;
+    double alpha = alpha0;
+    double m = 1.0;
     for (uint32_t n = 1; n <= MAX_BURST_N; n++) {
-        double alpha = 0.0;        // 静默期后 α 已衰减到 ≈0（学费置的 1 已耗散）
-        double m = 1.0;
-        bool mark = false;         // 降速标记（CNP 到达置位，刀消费后清除）
-        // CNP 在 t=1..n 到达（burstInterval=1us）；α 每 1us 更新；刀每 4us 消费 mark
-        for (uint32_t t = 1; t <= n + cutUs; t++) {
-            if (t <= n) {
-                alpha = (1.0 - g) * alpha + g;   // 本 1us 内有 CNP 到达，拉高 α
-                mark = true;                     // CNP 置降速标记
-            } else {
-                alpha = (1.0 - g) * alpha;       // 无 CNP，衰减
-            }
-            if (t % cutUs == 0 && mark) {
-                m *= (1.0 - alpha / 2.0);        // 砍一刀
-                mark = false;
-            }
-        }
+        alpha = (1.0 - g) * alpha + g;           // CNP 到达的 1us
+        for (int k = 0; k < 3; k++)
+            alpha *= (1.0 - g);                  // 随后 3us 衰减
+        m *= (1.0 - alpha / 2.0);                // 4us 末消费一刀
         m_M[n] = m;
     }
 }
@@ -432,7 +432,7 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
                        (double)f.observeBytes / 1048576.0);
             }
             f.pendingSilent = true;
-            f.burstRemaining = 8;
+            f.burstRemaining = 2;
             BurstTick(key);
         }
     } else if (f.state == DciExtSndFlow::SILENT && now >= f.silentUntil) {
@@ -462,7 +462,7 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
         // 发送方周期维持任务：以首调时刻为起点，每 T 结算 R_snd 并压制超配
         //（首个流进入 CTL 时启动一次；后续新流首调不再重复启动）
         if (m_sndTickEvent.IsExpired() || !m_sndTickEvent.IsRunning())
-            m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
+            m_sndTickEvent = Simulator::Schedule(m_sndTickPeriod, &DciExt::SndTick, this);
     }
 }
 
@@ -507,7 +507,7 @@ void DciExt::SndTick() {
             }
         }
     }
-    m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
+    m_sndTickEvent = Simulator::Schedule(m_sndTickPeriod, &DciExt::SndTick, this);
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +799,7 @@ void DciExt::BurstTick(DciExtFlowKey key) {
     SendCnpForFlow(key);
     f.burstRemaining--;
     if (f.burstRemaining > 0) {
-        f.burstEvent = Simulator::Schedule(m_burstInterval, &DciExt::BurstTick, this, key);
+	f.burstEvent = Simulator::Schedule(m_burstInterval, &DciExt::BurstTick, this, key);
     } else {
         // burst 结束：学费 burst → 转静默；重置 DIP 结算基准
         if (f.pendingSilent) {

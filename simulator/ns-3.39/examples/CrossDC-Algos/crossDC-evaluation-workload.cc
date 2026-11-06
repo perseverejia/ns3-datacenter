@@ -114,6 +114,7 @@ double pfc_ingress_alpha = 1.0 / 8;
 // DCI-Ext (ccMode=16) 参数（X_OFF 派生自 PFC_INGRESS_POOL_MB × PFC_INGRESS_ALPHA）
 uint32_t dciext_burst_interval_us = 1;  // CNP 连发间隔（对应 1us alpha 更新窗口）
 double dciext_t_us = 1000;             // 接收方反馈周期 T（us）
+double dciext_snd_tick_us = 0;         // 发送方压制周期(us); 0=跟随 T
 double dciext_dip_bw_g = 40;           // DIP 带宽 B（Gbps，N>=3 时的分配基准）
 uint64_t dciext_observe_mb = 20;       // 新流观察期（MB，线速传输）
 uint32_t dciext_silent_us = 1000;      // 观察期满学费 CNP 后静默时长（alpha 衰减到 ~1/256）
@@ -1138,6 +1139,11 @@ int main(int argc, char *argv[])
 			conf >> v;
 			dciext_t_us = v;
 			std::cout << "DCIEXT_T_US\t\t\t" << v << "\n";
+		} else if (key.compare("DCIEXT_SND_TICK_US") == 0) {
+			double v;
+			conf >> v;
+			dciext_snd_tick_us = v;
+			std::cout << "DCIEXT_SND_TICK_US\t\t" << v << "\n";
 		} else if (key.compare("DCIEXT_DIP_BW_G") == 0) {
 			double v;
 			conf >> v;
@@ -1790,6 +1796,7 @@ int main(int argc, char *argv[])
 					                       dciext_observe_mb, dciext_silent_us,
 					                       dciext_aging_periods, /*senderSide=*/true,
 						                       dciext_dt_us, dciext_sigma_us);
+                                        if (dciext_snd_tick_us > 0) sw->SetDciExtSndTickUs(dciext_snd_tick_us);
 				}
 
 				auto gatewayIt = gatewayNodeType.find(i);

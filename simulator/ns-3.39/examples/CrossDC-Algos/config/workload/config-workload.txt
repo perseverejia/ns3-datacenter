@@ -47,7 +47,7 @@ CC_MODE 1
 ALPHA_RESUME_INTERVAL 1
 RATE_DECREASE_INTERVAL 4
 CLAMP_TARGET_RATE 1
-RP_TIMER 900
+RP_TIMER 30
 EWMA_GAIN 0.00390625
 FAST_RECOVERY_TIMES 5
 DCQCN_BYTE_RECOVERY_ENABLED 1
@@ -101,9 +101,10 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 # 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
 # ================================================================================
 # CNP 连发间隔（对应 1us alpha 更新窗口）
-DCIEXT_BURST_INTERVAL_US 1
+DCIEXT_BURST_INTERVAL_US 4
 # 接收方反馈周期 T（us）：每 T 聚合表一/表二并发 0xFA，RTT 探测/可用带宽更新周期
 DCIEXT_T_US 500
+DCIEXT_SND_TICK_US 400
 # 期望跨域流排队时延 Dt（us）：RTT_t = RTT_base + Dt
 DCIEXT_DT_US 4
 # RTT 目标区间容差 sigma（us）：[RTT_t-sigma, RTT_t+sigma] 内直接用 ACK 速率
@@ -112,7 +113,7 @@ DCIEXT_SIGMA_US 3
 DCIEXT_DIP_BW_G 40
 # 新流观察期（MB，线速传输）：期满发学费 CNP 后静默 1ms 让 alpha 衰减
 DCIEXT_OBSERVE_MB 20
-DCIEXT_SILENT_US 1000
+DCIEXT_SILENT_US 400
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
 # 发送方 DCI 交换机列表（multiDC 中继拓扑：SW21、SW23 = 两条长链路发送端，表A+观察期+ECN反馈+0xFA消费）

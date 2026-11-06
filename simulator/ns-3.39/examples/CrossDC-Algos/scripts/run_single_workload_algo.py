@@ -188,7 +188,7 @@ def parse_tx_rate(lines, ip_to_node, query_flow_keys):
     tx_rates = {}
     pattern = re.compile(
         r"\[TX RATE\] Host (\d+) sip (\d+) dip (\d+) sport (\d+) dport (\d+) "
-        r"pg (\d+) txRate ([\d.]+)bps t (\d+)ns"
+        r"pg (\d+) txRate ([\d.]+)bps(?: rt [\d.]+bps)? t (\d+)ns"
     )
     for line in lines:
         match = pattern.search(line)

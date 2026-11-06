@@ -17,6 +17,9 @@
 #include "epfc.h"        // ePFC (ccMode=17)：标记位定义
 #include <cmath>         // std::abs
 #include <cstring>       // memcpy
+// ---- 日志宏：必须在所有 #if 使用点之前定义（预处理器单遍，后定义 = 未定义 = 0）----
+#define PRINT_LOG 0     // DCQCN_CNP / DCQCN 恢复事件 / EPFC_CCF_RATE 等调试日志
+#define TX_RATE_LOG 1   // [TX RATE] 逐流发送速率打点（plot_tx_rate 画图依赖）
 
 namespace ns3 {
 
@@ -599,6 +602,12 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 			qp->hpccPint.m_curRate = dev->GetDataRate();
 		}
 	}
+	if (m_cc_mode == 16) {
+		// DCI-Ext: 发送方 DCI 的 CNP（学费/FIRST_CTL/HOLD/FAST）接入端侧
+		// DCQCN 状态机——v3 重构遗漏的端侧消费路径；首次 CNP 触发 alpha=1
+		// 初始化 + 启动 1us alpha 调度，后续 CNP 置位由 4us 定时器消费降速
+		cnp_received_mlx(qp);
+	}
 	return 0;
 }
 
@@ -873,11 +882,11 @@ void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
 	// stdio stream, so each printf call is serialized instead of being
 	// interleaved after the runner redirects stdout and stderr to one file.
 	#if TX_RATE_LOG
-	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps t %luns\n",
+	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps rt %.0fbps t %luns\n",
 	        m_node->GetId(),
 	        qp->sip.Get(), qp->dip.Get(),
 	        qp->sport, qp->dport, qp->m_pg,
-	        rateBps, now.GetNanoSeconds());
+	        rateBps, (double)qp->mlx.m_targetRate.GetBitRate(), (unsigned long long)now.GetNanoSeconds());
 	#endif
 
 	qp->txRate.lastSeq = curSeq;
@@ -898,8 +907,6 @@ void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate) {
 	qp->m_rate = new_rate;
 }
 
-#define PRINT_LOG 0
-#define TX_RATE_LOG 1  // [TX RATE] plot_tx_rate 依赖; 独立于 PRINT_LOG
 /******************************
  * Mellanox's version of DCQCN
  *****************************/
@@ -956,8 +963,19 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q) {
 			if (q->mlx.m_rpTimeStage == 0)
 				clamp = false;
 		}
-		if (clamp)
-			q->mlx.m_targetRate = q->m_rate;
+		if (clamp) {
+			// ccMode=16：Rt 下限 = 1/4 链路带宽——CLAMP=1 把 Rt 锁到砍穿后的低速率，
+			// 会让 FastRecovery 5 档全部向地板逼近（域内流 ~300ms 慢爬）；
+			// 下限保证砍穿后 3~4 档（~4ms）即可回到 1/4 带宽平台
+			if (m_cc_mode == 16) {
+				uint32_t nic_idx = GetNicIdxOfQp(q);
+				Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+				DataRate floorRt(dev->GetDataRate().GetBitRate() / 4);
+				q->mlx.m_targetRate = std::max(q->m_rate, floorRt);
+			} else {
+				q->mlx.m_targetRate = q->m_rate;
+			}
+		}
 		// ePFC (ccMode=17)：CCF 设速窗口内 CNP 降速下限钳制在 rv——
 		// CCF 每 90μs 才设速一次（周期机制），CNP 持续到达持续降速，降多设少会净向下漂移；
 		// 窗口期由 ePFC 主导（CCF 即速率指令），DCQCN 降速不得低于 rv

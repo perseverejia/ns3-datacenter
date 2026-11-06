@@ -1143,6 +1143,10 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
 //                               + ECN 快速反馈 + 0xFA 反馈消费/查表连发
 //   接收侧（senderSide=false）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 // ============================================================================
+void SwitchNode::SetDciExtSndTickUs(double us) {
+	m_dciExt.SetSndTickUs(us);
+}
+
 void SwitchNode::InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
                                    double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
                                    uint32_t agingPeriods, bool senderSide,

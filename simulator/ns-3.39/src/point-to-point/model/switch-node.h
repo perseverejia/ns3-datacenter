@@ -159,6 +159,7 @@ public:
 	void ReadAtcConfigFromFile(const std::string& configFile);                  // 从配置文件读取 ATC 参数
 
 	// ========== DCI-Ext (ccMode=16) 接口 ==========
+      void SetDciExtSndTickUs(double us); // 透传: 发送方压制周期
 	void InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
 	                      double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
 	                      uint32_t agingPeriods, bool senderSide = false,
