@@ -74,8 +74,9 @@ struct DciExtRcvDip {
     bool hasRAvbl;     // 是否已首次获取（首次 = 直接用 ACK 返回速率）
     double rttBaseUs;  // DC 内 RTT 运行最小值（RTT_base）
     bool hasRttBase;
+    bool lastCongested; // 上一周期分支是否为 CONGESTED（RTT > RTT_t+σ）
 
-    DciExtRcvDip() : rAvblBps(0), hasRAvbl(false), rttBaseUs(1e18), hasRttBase(false) {}
+    DciExtRcvDip() : rAvblBps(0), hasRAvbl(false), rttBaseUs(1e18), hasRttBase(false), lastCongested(false) {}
 };
 
 // 发送方流表项：观察期状态机

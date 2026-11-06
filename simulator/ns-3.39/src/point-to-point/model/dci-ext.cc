@@ -517,7 +517,8 @@ void DciExt::SndTick() {
 //      DCI→DC 出队口径）、纯DC内RTT样本（出队打点 -> ACK 回到差分）
 //   3. RTT 探测状态机（RTT_base = 运行最小值；RTT_t = RTT_base + Dt）：
 //      a. 首次获取 → R_avbl = ACK 速率；|RTT − RTT_t| ≤ σ → R_avbl = ACK 速率
-//      b. RTT > RTT_t + σ（排队超预期）→ R_avbl 保持不变
+//         （限制：上一周期若为 CONGESTED，本周期不得立即用 ACK 抬回，保持不变）
+//      b. RTT > RTT_t + σ（排队超预期）→ R_avbl = min(ACK 速率, 当前值)，只降不升
 //      c. RTT < RTT_t − σ（队列低于目标）→ 增速：
 //         Wt = (1/D − 1/Dt + W/RTT) × RTT_t，R_avbl = Wt/T
 //         （W=上个T DCI发给DC的字节数，D=RTT−RTT_base；主导项 W/RTT×RTT_t
@@ -617,15 +618,23 @@ void DciExt::PeriodicTick() {
         } else if (rd.hasRttBase && a.rttCnt > 0) {
             double rttT = rd.rttBaseUs + m_dtUs;
             if (rttAvgUs >= rttT - m_sigmaUs && rttAvgUs <= rttT + m_sigmaUs) {
-                // a. RTT 在目标区间：ACK 速率即真实可用带宽
-                if (ackRateBps > 0) {
-                    rd.rAvblBps = ackRateBps;
-                    branch = "STEADY";
+                // a. RTT 在目标区间：ACK 速率即真实可用带宽；但上一周期若为
+                //    CONGESTED（排队超预期），压制刚生效，不得立即用 ACK 抬回
+                if (!rd.lastCongested) {
+                    if (ackRateBps > 0) {
+                        rd.rAvblBps = ackRateBps;
+                        branch = "STEADY";
+                    } else {
+                        branch = "STEADY_ACK0"; // ACK 断流，保持不变
+                    }
                 } else {
-                    branch = "STEADY_ACK0"; // ACK 断流，保持不变
+                    branch = "STEADY_HOLD"; // 上周期过拥：保持不变，防止回弹
                 }
             } else if (rttAvgUs > rttT + m_sigmaUs) {
-                branch = "CONGESTED"; // b. 排队超预期：保持不变（发送方自查压制兑住）
+                // b. 排队超预期：R_avbl 只降不升——取 ACK 速率与当前值最小
+                //   （能走到此处 ackRate >= B/10，非 0；压低后由发送方压制兑住）
+                rd.rAvblBps = std::min(rd.rAvblBps, ackRateBps);
+                branch = "CONGESTED";
             } else {
                 // c. RTT < RTT_t - sigma：队列低于目标，增速探测
                 //   Wt = (1/D − 1/Dt + W/RTT) × RTT_t；R_avbl = Wt/T
@@ -653,6 +662,11 @@ void DciExt::PeriodicTick() {
         } else {
             branch = "NO_SAMPLE"; // 尚无 RTT 样本：保持不变
         }
+
+        // 记录本周期分支，供下周期 STEADY 的回弹限制使用
+        // （STALL_HOLD 的 RTT 统计不可信，保持原值不更新）
+        if (branch != "STALL_HOLD")
+            rd.lastCongested = (branch == "CONGESTED");
 
         if (m_debug) {
             printf("[DCIEXT_STATS] %lu node=%u dip=0x%08x N=%u txRate=%.3fG ackRate=%.3fG "
