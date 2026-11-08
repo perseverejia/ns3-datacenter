@@ -8,6 +8,8 @@
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 #include "switch-node.h"
+#include "grc-settings.h"
+#include "grc-wan-routing.h"
 #include "qbb-net-device.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
@@ -145,6 +147,14 @@ SwitchNode::SwitchNode() {
 	m_epfc.SetGateCallback(MakeCallback(&SwitchNode::EpfcGateHelper, this));
 }
 
+void SwitchNode::InitializeGrc(uint32_t dc, const std::map<uint32_t, uint32_t>& routes) {
+	if (m_ccMode != 18) return;
+	NS_ABORT_MSG_IF(!GrcSettings::enabled || m_grc, "GRC must be configured once before initialization");
+	m_grc = CreateObject<GrcWanRouting>();
+	m_grc->SetSwitchSendToDevCallback(MakeCallback(&SwitchNode::SendToDev, this));
+	m_grc->Init(this, dc, routes);
+}
+
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch) {
 	// look up entries
 	Ptr<Packet> cp = p->Copy();
@@ -274,7 +284,10 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch) {
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize(), found, unsched);
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize(), found);
 			} else {
-				return; // Drop
+				if (m_ccMode == 18 && GrcLog::events && ch.l3Prot == 0x11)
+                    GrcLog::Event("drop", GetId(), ch.sip, ch.dip, ch.udp.sport,
+                                  ch.udp.dport, ch.udp.pg, p->GetUid(), ch.udp.seq, "mmu");
+                return; // Drop
 			}
 			CheckAndSendPfc(inDev, qIndex);
 		}
@@ -341,6 +354,10 @@ void SwitchNode::ClearTable() {
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch) {
+    if (m_ccMode == 18 && m_grc) {
+        m_grc->RouteInput(packet, ch);
+        return true;
+    }
 	// DCI-Ext (ccMode=16): 发送方消费 0xFA 反馈（拦截）；其余建表/统计/ECN清除
 	if (m_dciExtEnabled) {
 		if (m_dciExt.PacketIn(device, packet, ch))

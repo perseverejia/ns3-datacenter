@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 crossDC workload algorithm runner script.
-Workload parameters live in simulator/ns-3.39/examples/PowerTCP/config-workload.txt.
+Workload parameters live in simulator/ns-3.39/examples/CrossDC-Algos/config/workload/config-workload.txt.
 Specify only the algorithm here, for example:
     python3 run_single_workload_algo.py 13 FRP
 """
@@ -100,7 +100,7 @@ RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
 PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
 TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
-PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
+PLOTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "plots")
 ANALYSIS_DIR = os.path.join(RESULTS_DIR, "analysis")
 ATC_ALGO_MODE = 15
 ATC_BASE_CC_MODE = 1
@@ -455,6 +455,7 @@ def run_and_plot(args):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(FCT_DIR, exist_ok=True)
     os.makedirs(PFC_DIR, exist_ok=True)
+    os.makedirs(PLOTS_DIR, exist_ok=True)
 
     config_path = os.path.join(NS3_DIR, CONFIG_FILE)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -563,8 +564,8 @@ def run_and_plot(args):
             if m:
                 totals["background"] = int(m.group(1))
 
-            if "[DCQCN_QLEN]" in line and sim_cc_mode in (1, 3, 7, 16, 17):
-                # ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
+            if "[DCQCN_QLEN]" in line and sim_cc_mode in (1, 3, 7, 16, 17, 18):
+                # ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
                 parts = line.split()
                 if len(parts) >= 5:
                     sw = int(parts[2])
@@ -690,7 +691,7 @@ def run_and_plot(args):
         pfc_by_flow = map_pfc_events_to_flows(pfc_events, port_map, topo_adj, sorted(tx_rates))
         os.makedirs(TXRATE_DIR, exist_ok=True)
         tx_rate_output_file = os.path.join(
-            TXRATE_DIR,
+            PLOTS_DIR,
             f"workload_txrate_{args.algo_name.lower()}_cc{args.ccMode}_load{load_tag(load)}.png",
         )
         if tx_rates:
@@ -917,6 +918,7 @@ Algorithm ccMode Mapping:
   atc        -> ccMode=15  (ATC)
   dciext     -> ccMode=16  (DCI-Ext: 接收侧 DCI 端口门控 + 逐流 CNP，部署交换机由 GATEWAY_DST 指定)
   epfc       -> ccMode=17  (ePFC: PFC 的流级扩展，所有交换机打标 + 边缘交换机沿 CCF 反馈掐断贡献者流)
+  grc        -> ccMode=18  (GRC: DCI 网侧控制，端侧复用现有 DCQCN)
 
 Examples:
   python3 run_single_workload_algo.py 1 DCQCN
@@ -924,6 +926,7 @@ Examples:
   python3 run_single_workload_algo.py 15 ATC
   python3 run_single_workload_algo.py 16 DCIEXT
   python3 run_single_workload_algo.py 17 EPFC
+  python3 run_single_workload_algo.py 18 GRC
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -6,7 +6,7 @@ set -e  # 遇到错误立即退出
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CROSSDC_DIR="$(dirname "$SCRIPT_DIR")"
-NS3_DIR="$(dirname "$(dirname "$(dirname "$CROSSDC_DIR")")")"
+NS3_DIR="$(dirname "$(dirname "$CROSSDC_DIR")")"
 
 echo "=========================================="
 echo "CrossDC-Algos 批量运行脚本"
@@ -24,6 +24,7 @@ declare -a ALGOS=(
     "13:FRP"
     "14:ROCC"
     "12:Bifrost"
+    "18:GRC"
 )
 
 # 检查是否指定了特定的算法
@@ -56,10 +57,10 @@ for algo_spec in "${SELECTED_ALGOS[@]}"; do
     
     if python3 "$CROSSDC_DIR/scripts/run_single_workload_algo.py" "$CC_MODE" "$ALGO_NAME"; then
         echo "✅ $ALGO_NAME 运行成功"
-        ((SUCCESS_COUNT++))
+        ((SUCCESS_COUNT+=1))
     else
         echo "❌ $ALGO_NAME 运行失败"
-        ((FAIL_COUNT++))
+        ((FAIL_COUNT+=1))
         FAILED_ALGOS+=("$ALGO_NAME(ccMode=$CC_MODE)")
     fi
     

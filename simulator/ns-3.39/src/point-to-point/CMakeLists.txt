@@ -40,6 +40,9 @@ build_lib(
     model/atcGateway.cc
     model/dci-ext.cc
     model/epfc.cc
+    model/grc-wan-routing.cc
+    model/grc-settings.cc
+    helper/grc-helper.cc
   HEADER_FILES
     ${mpi_headers}
     helper/point-to-point-helper.h
@@ -65,6 +68,9 @@ build_lib(
     model/atcGateway.h
     model/dci-ext.h
     model/epfc.h
+    model/grc-wan-routing.h
+    model/grc-settings.h
+    helper/grc-helper.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}
                     ${internet}

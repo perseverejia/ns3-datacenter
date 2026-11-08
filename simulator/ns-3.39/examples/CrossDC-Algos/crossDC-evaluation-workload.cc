@@ -28,7 +28,9 @@
 #include <cstdlib>
 #include <limits>
 #include <sstream>
+#include <filesystem>
 #include "ns3/core-module.h"
+#include "ns3/grc-helper.h"
 #include "ns3/qbb-helper.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/applications-module.h"
@@ -866,6 +868,7 @@ int main(int argc, char *argv[])
 	std::string queryFlowFctFile = "";  // Will be set via command line
 
 	uint32_t algorithm = 3;
+	std::map<std::string, std::string> grcParameters;
 	uint32_t windowCheck = 1;
 	uint32_t gatewayTypeOverride = UINT32_MAX;
 	std::string confFile = "examples/CrossDC-Algos/config/workload/config-testbed.txt";
@@ -1088,6 +1091,9 @@ int main(int argc, char *argv[])
 			conf >> v;
 			error_rate_per_link = v;
 			std::cout << "ERROR_RATE_PER_LINK\t\t" << error_rate_per_link << "\n";
+		}
+		else if (key.rfind("GRC_", 0) == 0) {
+			conf >> grcParameters[key.substr(4)];
 		}
 		else if (key.compare("CC_MODE") == 0) {
 			conf >> cc_mode;
@@ -1874,6 +1880,7 @@ int main(int argc, char *argv[])
 			else if (algorithm == 7) algo_suffix = "timely";  // Timely is ccMode=7
 			else if (algorithm == 10) algo_suffix = "dctcp";
 			else if (algorithm == 16) algo_suffix = "dciext";  // DCI-Ext uses ccMode=16
+			else if (algorithm == 18) algo_suffix = "grc";
 			else algo_suffix = "unknown";
 			
 			queryFlowFctFile = "/home/shemuping/newCode/ns3-FRP/results/workload/fct/query-flow-" + algo_suffix + ".txt";
@@ -1909,7 +1916,8 @@ int main(int argc, char *argv[])
 			rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));
 			rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));
 			rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));
-			rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
+			// GRC is a network policy; keep the existing DCQCN endpoint unchanged.
+			rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode == 18 ? 1 : cc_mode));
 			rdmaHw->SetAttribute("RateDecreaseInterval", DoubleValue(rate_decrease_interval));
 			rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
 			rdmaHw->SetAttribute("Mtu", UintegerValue(packet_payload_size));
@@ -2130,6 +2138,10 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (cc_mode == 18)
+		GrcHelper::Install(cc_mode, n, serverAddress, g_hostToDc, g_switchToDc,
+		                   dci_switches, grcParameters, randomSeed);
+
 	Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 	// Ptr<OutputStreamWrapper> routingStream = Create<OutputStreamWrapper> (&std::cout);
 	// globalRoutingHelper.PrintRoutingTableAt (Seconds (0.0), n.Get(0), routingStream);
@@ -2199,19 +2211,21 @@ int main(int argc, char *argv[])
 		else if (algorithm == 7) algo_name = "timely";
 		else if (algorithm == 15) algo_name = "atc";
 		else if (algorithm == 16) algo_name = "dciext";
+		else if (algorithm == 18) algo_name = "grc";
 		else algo_name = "unknown";
 		
 		// 构建文件名: bottleneck_{algo}_{cdf}_load{load}.txt
 		char load_str[32];
 		snprintf(load_str, sizeof(load_str), "%.2f", load);
-		bottleneck_mon_file = "/home/gj/ns3/results/workload/bottleneck_queue_length/bottleneck_" 
+		bottleneck_mon_file = "examples/CrossDC-Algos/results/bottleneck_queue_length/bottleneck_"
 		                      + algo_name + "_" + cdf_base + "_load" + load_str + ".txt";
 	}
 	
 	// 启动瓶颈队列监控
 	if (!bottleneck_mon_file.empty()) {
 		// 确保输出目录存在
-		system("mkdir -p /home/gj/ns3/results/workload/bottleneck_queue_length");
+		auto directory = std::filesystem::path(bottleneck_mon_file).parent_path();
+		if (!directory.empty()) std::filesystem::create_directories(directory);
 		
 		FILE* bn_fp = fopen(bottleneck_mon_file.c_str(), "w");
 		if (bn_fp) {
@@ -2229,6 +2243,7 @@ int main(int argc, char *argv[])
 	Simulator::Stop(Seconds(simulator_stop_time));
 	Simulator::Run();
 	Simulator::Destroy();
+	if (cc_mode == 18) GrcSettings::Reset();
 	NS_LOG_INFO("Done.");
 	endt = clock();
 	std::cout << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";

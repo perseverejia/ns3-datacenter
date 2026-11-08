@@ -11,6 +11,7 @@
 #include "ns3/atcGateway.h"
 #include "dci-ext.h"
 #include "epfc.h"
+#include "grc-wan-routing.h"
 
 namespace ns3 {
 
@@ -102,6 +103,7 @@ private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
 	Ptr<QbbNetDevice> GetOutDevice(Ptr<Packet> p, CustomHeader &ch);
 	void SendToDev(Ptr<Packet>p, CustomHeader &ch);
+    Ptr<GrcWanRouting> m_grc;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
@@ -173,6 +175,9 @@ public:
 	                    double updateTUs);   // 初始化 ePFC（ccMode=17 时所有交换机部署）
 	void EpfcGateHelper(uint32_t portIdx, uint8_t pg, bool on);  // ePFC 门控回调：本地门控指定端口（SetDciExtGate）
 	void EpfcDequeueHelper(uint32_t outPort, Ptr<Packet> p);  // ePFC 出队计量回调：读 Tag 调 DataDequeue（S 口径=物理发出）
+
+	// ========== GRC (ccMode=18) 初始化（仅 DCI） ==========
+	void InitializeGrc(uint32_t dc, const std::map<uint32_t, uint32_t>& routes);
 
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);

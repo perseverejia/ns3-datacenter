@@ -95,6 +95,26 @@ ATC_VOQ_REACT_TO_CNP 1
 ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
+# [GRC] ccMode=18 - DCI 交换机上的跨数据中心拥塞控制
+# 仅在模式18启用，DCI 节点与所属 DC 从现有拓扑自动识别
+# 端侧复用现有 DCQCN，沿用本配置的拓扑、流量与通用参数
+# ================================================================================
+GRC_WAN_EPOCH_US 1000
+# RTT 样本随 ACK 到达；以上周期用于样本汇总和速率更新
+# 以下依次为 RTT 平滑时间、采样表项超时、重传歧义过滤窗口（微秒）
+GRC_RTT_EWMA_US 1000
+GRC_RTT_ENTRY_TIMEOUT_US 30000
+GRC_RTT_RTO_FILTER_US 35000
+GRC_INV_DELTA 6291456
+GRC_BETA 0.3
+GRC_GUARANTEED_RATE_FACTOR 0.25
+GRC_W_MAX 4
+GRC_W_K_SYNC_INTERVAL_MS 30
+GRC_BASE_RTT_WINDOW_MS 10000
+GRC_TRACE_EVENTS 1
+GRC_LOG_DIR examples/CrossDC-Algos/results/grc
+
+# ================================================================================
 # [HPCC] ccMode=3 - HPCC/PowerTCP 基于 INT 遥测
 # ================================================================================
 DCTCP_RATE_AI 1000Mb/s
