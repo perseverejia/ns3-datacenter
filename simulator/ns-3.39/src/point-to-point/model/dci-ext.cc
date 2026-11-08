@@ -153,31 +153,66 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                        e.rAvblBps / 1e9, e.sndRateBps / 1e9, (unsigned long)(e.sndBytes));
             }
 
-            // 过载判定：R_snd/R_avbl - 1 > 0 → 查表连发
-            //   ratio = R_avbl/R_snd，每条受控流降到同一比例 r → 聚合收敛到 R_avbl
-            //   防御：rAvbl<=0 时跳过（反债异常值不得触发 MAX 连发轰炸）
-            if (e.rAvblBps > 0 && e.sndRateBps > e.rAvblBps && e.sndRateBps > 0) {
-                double ratio = e.rAvblBps / e.sndRateBps;
-                uint32_t n = LookupN(ratio);
-                if (n == 0)
-                    n = 1;
-                if (m_debug) {
-                    printf("[DCIEXT_CNP] %lu node=%u type=OVERLOAD n=%u dip=0x%08x "
-                           "R_snd=%.3fG R_avbl=%.3fG ratio=%.3f\n",
-                           now.GetTimeStep(), m_nodeId, n, dip,
-                           e.sndRateBps / 1e9, e.rAvblBps / 1e9, ratio);
-                }
-                for (auto &kv : m_sndFlows) {
-                    DciExtSndFlow &f = kv.second;
-                    if (f.dip != dip || f.state != DciExtSndFlow::CTL)
-                        continue;           // 观察/静默期流不受本轮压制
-                    if (f.burstRemaining > 0)
-                        continue;           // 已有 burst 在发，避免并发
-                    f.burstRemaining = n;
-                    BurstTick(kv.first);
+            // BDP 管道填充控制：v = (P×(T+RTT_cross) − Inflight)/T，ratio = v/R_snd
+            //   替代原 R_avbl/R_snd——把“速率配额”改为“管道水位缺口折算的本周期应发速率”
+            if (e.rAvblBps > 0 && e.sndRateBps > 0) {
+                double vBps = ComputeV(e, m_sndTickPeriod.GetSeconds());
+                // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
+                double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
+                if (e.sndRateBps > effBps) {
+                    double ratio = effBps / e.sndRateBps;
+                    uint32_t n = LookupN(ratio);
+                    if (n == 0)
+                        n = 1;
+                    if (m_debug) {
+                        printf("[DCIEXT_CNP] %lu node=%u type=OVERLOAD n=%u dip=0x%08x "
+                               "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
+                               now.GetTimeStep(), m_nodeId, n, dip,
+                               e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
+                               (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
+                               e.rttCrossMaxUs, ratio);
+                    }
+                    for (auto &kv : m_sndFlows) {
+                        DciExtSndFlow &f = kv.second;
+                        if (f.dip != dip || f.state != DciExtSndFlow::CTL)
+                            continue;           // 观察/静默期流不受本轮压制
+                        if (f.burstRemaining > 0)
+                            continue;           // 已有 burst 在发，避免并发
+                        f.burstRemaining = n;
+                        BurstTick(kv.first);
+                    }
                 }
             }
             return true; // 拦截
+        }
+
+        // 跨域流 ACK 从长链路回来：ACK 水位差分扣减 Inflight + RTT_cross 采样
+        // （dataArrival 匹配模式与接收方 DCI 一致；rttCrossMaxUs 取运行最大值）
+        if (fromLongLink && ch.l3Prot == 0xFC) {
+            DciExtFlowKey ackKey(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport);
+            auto fit = m_sndFlows.find(ackKey);
+            if (fit != m_sndFlows.end()) {
+                DciExtSndFlow &f = fit->second;
+                auto dit = m_sndDips.find(f.dip);
+                if (dit != m_sndDips.end()) {
+                    DciExtSndDip &e = dit->second;
+                    uint32_t ackSeq = ch.ack.seq;
+                    if (ackSeq > f.ackWatermark) {
+                        e.ackedBytes += (uint64_t)(ackSeq - f.ackWatermark);
+                        f.ackWatermark = ackSeq;
+                        // RTT_cross 采样：确认最近被确认包的出长链->ACK到达差（含两个 5ms 长链）
+                        auto ub = f.dataArrival.upper_bound(ackSeq);
+                        if (ub != f.dataArrival.begin()) {
+                            --ub;
+                            double rttUs = (double)(Simulator::Now() - ub->second).GetTimeStep() / 1000.0;
+                            if (rttUs > e.rttCrossMaxUs)
+                                e.rttCrossMaxUs = rttUs;
+                            f.dataArrival.erase(f.dataArrival.begin(), std::next(ub));
+                        }
+                    }
+                }
+            }
+            return false; // ACK 放行转发（去往源主机）
         }
 
         // 跨域流数据包：DC 内入、出口走长链路
@@ -413,9 +448,15 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
     Time now = Simulator::Now();
     f.lastActive = now;
 
-    // 表A 发送字节累计
+    // 表A 发送字节累计 + Inflight dataSent 累计
     DciExtSndDip &e = m_sndDips[dip];
     e.sndBytes += payload;
+    e.dataSentBytes += payload;
+
+    // qbbHeader: sport(2) dport(2) flags(2) pg(2) seq(4) → seq 在 L4+8 = base+28
+    uint32_t seq = ((uint32_t)buf[base + 28] << 24) | ((uint32_t)buf[base + 29] << 16) |
+                   ((uint32_t)buf[base + 30] << 8) | buf[base + 31];
+    f.dataArrival[seq] = now; // 重传覆盖旧时间戳（RTT 归属最新发送）
 
     // 观察期状态机推进
     if (f.state == DciExtSndFlow::OBSERVE && !f.pendingSilent) {
@@ -473,6 +514,16 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
 //   压制有效性依赖 burst 结束时重置结算基准（BurstTick 内），
 //   否则窗口混入压制前的高速段 → 读数虚高 → 过压。
 // ---------------------------------------------------------------------------
+// BDP 管道填充控制（简化实验）：v 直接取 0.9P，
+//   压制带宽恒为可用带宽九折（不再依赖 inflight/RTT_cross 回归计算），
+//   目的：让跨域流稳态速率贴近均分线。
+//   首个 RTT 未回时（rttCrossMaxUs=0）仍按 P 传输。
+double DciExt::ComputeV(DciExtSndDip &e, double tSec) {
+    if (e.rttCrossMaxUs <= 0)
+        return e.rAvblBps;
+    return e.rAvblBps * 0.9;
+}
+
 void DciExt::SndTick() {
     if (!m_senderSide)
         return;
@@ -485,25 +536,33 @@ void DciExt::SndTick() {
         e.sndBytes = 0;
         e.lastSettle = now;
 
-        if (e.rAvblBps > 0 && e.sndRateBps > e.rAvblBps && e.sndRateBps > 0) {
-            double ratio = e.rAvblBps / e.sndRateBps;
-            uint32_t n = LookupN(ratio);
-            if (n == 0)
-                n = 1;
-            if (m_debug) {
-                printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
-                       "R_snd=%.3fG R_avbl=%.3fG ratio=%.3f\n",
-                       now.GetTimeStep(), m_nodeId, n, kv.first,
-                       e.sndRateBps / 1e9, e.rAvblBps / 1e9, ratio);
-            }
-            for (auto &fkv : m_sndFlows) {
-                DciExtSndFlow &f = fkv.second;
-                if (f.dip != kv.first || f.state != DciExtSndFlow::CTL)
-                    continue;
-                if (f.burstRemaining > 0)
-                    continue;
-                f.burstRemaining = n;
-                BurstTick(fkv.first);
+        if (e.rAvblBps > 0 && e.sndRateBps > 0) {
+            // BDP 管道填充控制（与 0xFA OVERLOAD 同式）：v vs R_snd 驱动查表连发
+            double vBps = ComputeV(e, m_sndTickPeriod.GetSeconds());
+            // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
+            double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
+            if (e.sndRateBps > effBps) {
+                double ratio = effBps / e.sndRateBps;
+                uint32_t n = LookupN(ratio);
+                if (n == 0)
+                    n = 1;
+                if (m_debug) {
+                    printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
+                           "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
+                           now.GetTimeStep(), m_nodeId, n, kv.first,
+                           e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
+                           (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
+                           e.rttCrossMaxUs, ratio);
+                }
+                for (auto &fkv : m_sndFlows) {
+                    DciExtSndFlow &f = fkv.second;
+                    if (f.dip != kv.first || f.state != DciExtSndFlow::CTL)
+                        continue;
+                    if (f.burstRemaining > 0)
+                        continue;
+                    f.burstRemaining = n;
+                    BurstTick(fkv.first);
+                }
             }
         }
     }
@@ -520,7 +579,7 @@ void DciExt::SndTick() {
 //         （限制：上一周期若为 CONGESTED，本周期不得立即用 ACK 抬回，保持不变）
 //      b. RTT > RTT_t + σ（排队超预期）→ R_avbl = min(ACK 速率, 当前值)，只降不升
 //      c. RTT < RTT_t − σ（队列低于目标）→ 增速：
-//         Wt = (1/D − 1/Dt + W/RTT) × RTT_t，R_avbl = Wt/T
+//         Wt = (1/D − 1/Dt + W/RTT) × RTT_t，R_avbl = max(当前值, Wt/T)，只升不降
 //         （W=上个T DCI发给DC的字节数，D=RTT−RTT_base；主导项 W/RTT×RTT_t
 //           使 R_avbl ≈ txRate × RTT_t/RTT，即目标延迟比侧速率控制；
 //           1/D、1/Dt 两项分子为 1 字节量级，仅作微调；clamp 到 B）
@@ -620,9 +679,10 @@ void DciExt::PeriodicTick() {
             if (rttAvgUs >= rttT - m_sigmaUs && rttAvgUs <= rttT + m_sigmaUs) {
                 // a. RTT 在目标区间：ACK 速率即真实可用带宽；但上一周期若为
                 //    CONGESTED（排队超预期），压制刚生效，不得立即用 ACK 抬回
+                //    更新取 max(ACK 速率, 当前值)：区间内 R_avbl 只升不降
                 if (!rd.lastCongested) {
                     if (ackRateBps > 0) {
-                        rd.rAvblBps = ackRateBps;
+                        rd.rAvblBps = std::max(rd.rAvblBps, ackRateBps);
                         branch = "STEADY";
                     } else {
                         branch = "STEADY_ACK0"; // ACK 断流，保持不变
@@ -655,7 +715,7 @@ void DciExt::PeriodicTick() {
                     rNewBps = m_dipBwBps;      // clamp 到 B
                 if (rNewBps < (m_dipBwBps / 64.0))
                     rNewBps = m_dipBwBps / 64.0; // 兕底防塌缩
-                rd.rAvblBps = rNewBps;
+                rd.rAvblBps = std::max(rd.rAvblBps, rNewBps); // 只升不降
                 branch = "PROBE";
                 }
             }

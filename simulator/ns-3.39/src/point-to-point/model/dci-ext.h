@@ -92,22 +92,29 @@ struct DciExtSndFlow {
     EventId burstEvent;
     Time lastActive;
     bool pendingSilent;      // 学费 5 连发中：burst 结束后才转入 SILENT（静默起点 = burst 结束）
+    uint32_t ackWatermark;   // ACK 累计确认水位（回程差分扣减 Inflight 用）
+    std::map<uint32_t, Time> dataArrival; // seq -> 出长链路时刻（RTT_cross 采样匹配）
 
     DciExtSndFlow() : sip(0), dip(0), sport(0), dport(0), pg(0),
                       state(OBSERVE), observeBytes(0), silentUntil(Seconds(0)),
-                      burstRemaining(0), lastActive(Seconds(0)), pendingSilent(false) {
+                      burstRemaining(0), lastActive(Seconds(0)), pendingSilent(false),
+                      ackWatermark(0) {
         burstEvent = EventId();
     }
 };
 
-// 发送方 表A：DIP 速度表【DIP, R_avbl, R_snd】
+// 发送方 表A：DIP 速度表【DIP, R_avbl, R_snd, Inflight, RTT_cross】
 struct DciExtSndDip {
-    double rAvblBps;      // 可用带宽（0xFA 更新；初始 = 长链路带宽 >> 2）
-    uint64_t sndBytes;    // 出长链路字节累计（payload 口径）
+    double rAvblBps;      // 可用带宽 P（0xFA 更新；初始 = 长链路带宽 >> 2）
+    uint64_t sndBytes;    // 出长链路字节累计（payload 口径，R_snd 结算源）
     double sndRateBps;    // R_snd：上次结算的发送速率（0xFA 到达时刻结算）
     Time lastSettle;      // 上次结算时刻
+    uint64_t dataSentBytes; // 已出长链路数据字节累计（Inflight = dataSent - acked）
+    uint64_t ackedBytes;    // 回程 ACK 已确认字节累计（水位差分）
+    double rttCrossMaxUs;   // 跨域 RTT 运行最大值（us，无样本时为 0）
 
-    DciExtSndDip() : rAvblBps(0), sndBytes(0), sndRateBps(0), lastSettle(Seconds(0)) {}
+    DciExtSndDip() : rAvblBps(0), sndBytes(0), sndRateBps(0), lastSettle(Seconds(0)),
+                     dataSentBytes(0), ackedBytes(0), rttCrossMaxUs(0) {}
 };
 
 class DciExt {
@@ -143,6 +150,7 @@ public:
     void SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps); // 0xFA 反馈
     void BurstTick(DciExtFlowKey key);              // 连发定时器回调
     uint32_t LookupN(double ratio) const;           // 查表: 目标压制比例 -> 连发个数 n
+    double ComputeV(DciExtSndDip &e, double tSec);  // BDP 管道填充: v = (P×(T+RTT_cross) - Inflight)/T
 
     bool m_debug;                 // 日志开关
     uint32_t m_nodeId;            // 宿主节点 ID（日志用）
