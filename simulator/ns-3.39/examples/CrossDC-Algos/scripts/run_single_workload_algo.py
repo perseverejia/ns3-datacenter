@@ -103,7 +103,6 @@ TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
 PLOTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "plots")
 ANALYSIS_DIR = os.path.join(RESULTS_DIR, "analysis")
 ATC_ALGO_MODE = 15
-ATC_BASE_CC_MODE = 1
 
 
 def load_tag(value):
@@ -442,13 +441,12 @@ def render_template(template, suffix, args, load):
 
 def run_and_plot(args):
     """Run workload simulation and generate plots."""
-    sim_cc_mode = ATC_BASE_CC_MODE if args.ccMode == ATC_ALGO_MODE else args.ccMode
     gateway_type = 2 if args.ccMode == ATC_ALGO_MODE else 0
 
     print(f"\n{'='*80}")
     print(f"Simulation: {args.algo_name} (ccMode={args.ccMode})")
     if args.ccMode == ATC_ALGO_MODE:
-        print(f"ATC mode: simulator ccMode={sim_cc_mode} (DCQCN), gatewayType={gateway_type}")
+        print(f"ATC mode: simulator ccMode={args.ccMode} (DCQCN), gatewayType={gateway_type}")
     print(f"{'='*80}\n")
 
     os.makedirs(DUMP_DIR, exist_ok=True)
@@ -517,7 +515,7 @@ def run_and_plot(args):
         cmd = [
             binary,
             f"--conf={config}",
-            f"--algorithm={sim_cc_mode}",
+            f"--algorithm={args.ccMode}",
             f"--gatewayType={gateway_type}",
             f"--randomSeed={args.randomSeed}",
             f"--fctOutputFile={fct_out}",
@@ -564,8 +562,8 @@ def run_and_plot(args):
             if m:
                 totals["background"] = int(m.group(1))
 
-            if "[DCQCN_QLEN]" in line and sim_cc_mode in (1, 3, 7, 16, 17, 18):
-                # ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
+            if "[DCQCN_QLEN]" in line and args.ccMode in (1, 3, 7, 15, 16, 17, 18):
+                # ccMode=15 (ATC) / ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
                 parts = line.split()
                 if len(parts) >= 5:
                     sw = int(parts[2])
@@ -576,9 +574,9 @@ def run_and_plot(args):
                     all_queue_data[(sw, port)]["times"].append(t_ms)
                     all_queue_data[(sw, port)]["queues"].append(q_kb)
 
-            if "[FRP_DATA_SW]" in line and sim_cc_mode in (13, 14):
+            if "[FRP_DATA_SW]" in line and args.ccMode in (13, 14):
                 parts = line.split()
-                if len(parts) >= 8 and int(parts[7]) == sim_cc_mode:
+                if len(parts) >= 8 and int(parts[7]) == args.ccMode:
                     sw = int(parts[2])
                     port = int(parts[3])
                     t_ms = float(parts[1]) * 1000

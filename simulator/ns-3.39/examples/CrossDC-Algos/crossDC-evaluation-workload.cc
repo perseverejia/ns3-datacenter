@@ -1916,8 +1916,7 @@ int main(int argc, char *argv[])
 			rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));
 			rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));
 			rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));
-			// GRC is a network policy; keep the existing DCQCN endpoint unchanged.
-			rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode == 18 ? 1 : cc_mode));
+			rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
 			rdmaHw->SetAttribute("RateDecreaseInterval", DoubleValue(rate_decrease_interval));
 			rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
 			rdmaHw->SetAttribute("Mtu", UintegerValue(packet_payload_size));
@@ -2200,17 +2199,17 @@ int main(int argc, char *argv[])
 		// 转小写
 		std::transform(cdf_base.begin(), cdf_base.end(), cdf_base.begin(), ::tolower);
 		
-		// 算法名称（ATC特殊处理：algorithm=1 + gatewayFlag=2）
+		// 算法名称
 		std::string algo_name;
 		if (algorithm == 13) algo_name = "frp";
 		else if (algorithm == 14) algo_name = "rocc";
-		else if (algorithm == 1 && gatewayFlag == 2) algo_name = "atc";
 		else if (algorithm == 1) algo_name = "dcqcn";
 		else if (algorithm == 3) algo_name = "hpcc";
 		else if (algorithm == 4) algo_name = "powertcp";
 		else if (algorithm == 7) algo_name = "timely";
 		else if (algorithm == 15) algo_name = "atc";
 		else if (algorithm == 16) algo_name = "dciext";
+		else if (algorithm == 17) algo_name = "epfc";
 		else if (algorithm == 18) algo_name = "grc";
 		else algo_name = "unknown";
 		

@@ -109,8 +109,8 @@ GrcHelper::Install(uint32_t ccMode,
             NS_ABORT_MSG_IF(!GrcSettings::hostIpToDc.emplace(addresses[id].Get(), dc).second,
                             "Duplicate GRC host IP");
             auto driver = node->GetObject<RdmaDriver>();
-            NS_ABORT_MSG_IF(driver && driver->m_rdma->m_cc_mode != 1,
-                            "GRC baseline requires the existing DCQCN endpoint (CcMode=1)");
+            NS_ABORT_MSG_IF(driver && driver->m_rdma->m_cc_mode != 18,
+                            "GRC requires the DCQCN endpoint path for CcMode=18");
             NS_ABORT_MSG_IF(driver && driver->m_rdma->m_ack_interval == 0,
                             "GRC requires ACKs for RTT measurement");
         }
