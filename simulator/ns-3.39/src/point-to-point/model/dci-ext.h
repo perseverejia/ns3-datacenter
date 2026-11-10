@@ -135,7 +135,6 @@ public:
     void SetGetDevByIndexCallback(Callback<Ptr<NetDevice>, uint32_t> cb);
     // 角色设置：true=发送方 DCI（表A+观察期+ECN反馈+0xFA消费），false=接收方 DCI（表一/二+0xFA生成）
     void SetSenderSide(bool enable) { m_senderSide = enable; }
-    void SetSndTickUs(double us); // 发送方压制周期(us); 默认跟随 T
 
     // ---------- 挂钩点（switch-node.cc 调用） ----------
     // 返回 true = 拦截该包（0xFA 到达发送方 DCI 即被消费，不再转发）
@@ -160,8 +159,7 @@ private:
     void BuildTable();            // 预计算 M[n] 压制乘子表
 
     Time m_burstInterval;         // CNP 连发间隔（对应 1us alpha 更新窗口）
-    Time m_periodT;               // 接收方反馈周期 T
-    Time m_sndTickPeriod;        // 发送方 SndTick 周期; Configure 默认跟随 T
+    Time m_periodT;               // 收发双方统一周期 T：接收方反馈、发送方压制
     double m_dipBwBps;            // DIP 带宽 B（N>=3 时的分配基准）
     uint64_t m_observeBytes;      // 新流观察期字节数（20MB 线速）
     Time m_silentUs;              // 观察期满学费 CNP 后的静默时长（1ms，alpha 衰减）

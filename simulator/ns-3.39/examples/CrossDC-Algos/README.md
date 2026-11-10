@@ -292,7 +292,7 @@ FCT 从各条流的实际开始时间计起，域内和跨域流分别统计。�
 
 DCI-Ext 和 ATC 的部署节点由所选配置指定，motivation 专用配置已设置下表节点。
 仅覆盖拓扑和查询流不会自动修改部署节点，应优先使用完整场景配置。
-参数已恢复到扫参前的 `DCIEXT_OBSERVE_MB 20`、`DCIEXT_SND_TICK_US 400`：
+新流观察期为 `DCIEXT_OBSERVE_MB 20`，收发双方共用周期 `DCIEXT_T_US 400`：
 
 | 场景 | 发送侧 DCI | 接收侧 DCI |
 | --- | --- | --- |

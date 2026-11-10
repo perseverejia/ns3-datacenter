@@ -14,7 +14,7 @@ namespace ns3 {
 DciExt::DciExt()
     : m_debug(true), m_nodeId(0), m_senderSide(false),
       m_burstInterval(MicroSeconds(1)),
-      m_periodT(MicroSeconds(1000)),
+      m_periodT(MicroSeconds(400)),
       m_dipBwBps(40e9), m_observeBytes(20ULL << 20), m_silentUs(MicroSeconds(1000)),
       m_agingPeriods(2) {
     BuildTable();
@@ -39,12 +39,6 @@ void DciExt::Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodT
     if (!m_senderSide && m_periodT > Seconds(0))
         m_periodEvent = Simulator::Schedule(m_periodT, &DciExt::PeriodicTick, this);
     m_sndTickEvent = EventId();
-	m_sndTickPeriod = m_periodT; // 压制周期默认跟随 T; 可被 SetSndTickUs 覆盖
-}
-
-void DciExt::SetSndTickUs(double us) {
-	if (us > 0)
-		m_sndTickPeriod = MicroSeconds(us);
 }
 
 void DciExt::SetSendCallback(Callback<void, Ptr<Packet>, CustomHeader&> cb) {
@@ -156,7 +150,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
             // BDP 管道填充控制：v = (P×(T+RTT_cross) − Inflight)/T，ratio = v/R_snd
             //   替代原 R_avbl/R_snd——把“速率配额”改为“管道水位缺口折算的本周期应发速率”
             if (e.rAvblBps > 0 && e.sndRateBps > 0) {
-                double vBps = ComputeV(e, m_sndTickPeriod.GetSeconds());
+                double vBps = ComputeV(e, m_periodT.GetSeconds());
                 // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
                 double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
                 if (e.sndRateBps > effBps) {
@@ -503,7 +497,7 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
         // 发送方周期维持任务：以首调时刻为起点，每 T 结算 R_snd 并压制超配
         //（首个流进入 CTL 时启动一次；后续新流首调不再重复启动）
         if (m_sndTickEvent.IsExpired() || !m_sndTickEvent.IsRunning())
-            m_sndTickEvent = Simulator::Schedule(m_sndTickPeriod, &DciExt::SndTick, this);
+            m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
     }
 }
 
@@ -538,7 +532,7 @@ void DciExt::SndTick() {
 
         if (e.rAvblBps > 0 && e.sndRateBps > 0) {
             // BDP 管道填充控制（与 0xFA OVERLOAD 同式）：v vs R_snd 驱动查表连发
-            double vBps = ComputeV(e, m_sndTickPeriod.GetSeconds());
+            double vBps = ComputeV(e, m_periodT.GetSeconds());
             // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
             double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
             if (e.sndRateBps > effBps) {
@@ -566,11 +560,11 @@ void DciExt::SndTick() {
             }
         }
     }
-    m_sndTickEvent = Simulator::Schedule(m_sndTickPeriod, &DciExt::SndTick, this);
+    m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
 }
 
 // ---------------------------------------------------------------------------
-// 接收方周期 T（T=100us）：RTT 驱动可用带宽探测 + 0xFA 反馈
+// 接收方周期 T：RTT 驱动可用带宽探测 + 0xFA 反馈
 //   1. 流老化：lastActive 距今 > agingPeriods×T 的流移出
 //   2. 聚合 per DIP：N、ackRate（winAckBytes×8/T）、txRate（winTxBytes×8/T，
 //      DCI→DC 出队口径）、纯DC内RTT样本（出队打点 -> ACK 回到差分）
