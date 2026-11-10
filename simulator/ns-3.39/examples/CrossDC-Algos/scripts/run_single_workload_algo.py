@@ -562,7 +562,7 @@ def run_and_plot(args):
             if m:
                 totals["background"] = int(m.group(1))
 
-            if "[DCQCN_QLEN]" in line and args.ccMode in (1, 3, 7, 15, 16, 17, 18):
+            if "[DCQCN_QLEN]" in line and args.ccMode in (1, 3, 7, 15, 16, 17, 18, 19):
                 # ccMode=15 (ATC) / ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
                 parts = line.split()
                 if len(parts) >= 5:
@@ -917,6 +917,7 @@ Algorithm ccMode Mapping:
   dciext     -> ccMode=16  (DCI-Ext: 接收侧 DCI 端口门控 + 逐流 CNP，部署交换机由 GATEWAY_DST 指定)
   epfc       -> ccMode=17  (ePFC: PFC 的流级扩展，所有交换机打标 + 边缘交换机沿 CCF 反馈掐断贡献者流)
   grc        -> ccMode=18  (GRC: DCI 网侧控制，端侧复用现有 DCQCN)
+  themis     -> ccMode=19  (THEMIS: PNP/TRP，端侧复用现有 DCQCN)
 
 Examples:
   python3 run_single_workload_algo.py 1 DCQCN
@@ -925,6 +926,7 @@ Examples:
   python3 run_single_workload_algo.py 16 DCIEXT
   python3 run_single_workload_algo.py 17 EPFC
   python3 run_single_workload_algo.py 18 GRC
+  python3 run_single_workload_algo.py 19 THEMIS
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

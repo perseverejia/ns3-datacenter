@@ -12,6 +12,7 @@
 #include "dci-ext.h"
 #include "epfc.h"
 #include "grc-wan-routing.h"
+#include "themis-gateway.h"
 
 namespace ns3 {
 
@@ -50,6 +51,7 @@ class SwitchNode : public Node{
 	double m_u[pCnt];
 
 protected:
+    void DoDispose() override;
 	bool m_ecnEnabled;
 	uint32_t m_ccMode;
 	uint64_t m_maxRtt;
@@ -104,6 +106,7 @@ private:
 	Ptr<QbbNetDevice> GetOutDevice(Ptr<Packet> p, CustomHeader &ch);
 	void SendToDev(Ptr<Packet>p, CustomHeader &ch);
     Ptr<GrcWanRouting> m_grc;
+    Ptr<ThemisGateway> m_themis;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
@@ -134,6 +137,9 @@ public:
 
 	static TypeId GetTypeId (void);
 	SwitchNode();
+	Ptr<ThemisGateway> InitializeThemis(uint32_t dc,
+	                                  const std::map<uint32_t, uint32_t>& hostIpToDc,
+	                                  const ThemisSettings& settings);
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();

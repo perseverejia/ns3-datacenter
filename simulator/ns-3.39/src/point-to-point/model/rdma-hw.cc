@@ -228,6 +228,11 @@ RdmaHw::RdmaHw() {
 	m_epfcRttUs = 30.0; // ePFC (ccMode=17)：内部流 RTT 默认值（workload 可覆盖）
 }
 
+bool RdmaHw::UsesDcqcn() const {
+	return m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 ||
+	       m_cc_mode == 17 || m_cc_mode == 18 || m_cc_mode == 19;
+}
+
 void RdmaHw::SetNode(Ptr<Node> node) {
 	m_node = node;
 }
@@ -315,7 +320,7 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 		qp->SetWin(m_bps.GetBitRate() * 1 * baseRtt * 1e-9 / 8);
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
-	if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN 发送端
+	if (UsesDcqcn()) { // 复用 DCQCN 发送端
 		qp->mlx.m_targetRate = m_bps;
 	} else if (m_cc_mode == 3) {
 		qp->hp.m_curRate = m_bps;
@@ -610,7 +615,7 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 	if (qp->m_rate == 0)			//lazy initialization
 	{
 		qp->m_rate = dev->GetDataRate();
-		if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN 发送端
+		if (UsesDcqcn()) { // 复用 DCQCN 发送端
 			qp->mlx.m_targetRate = dev->GetDataRate();
 		} else if (m_cc_mode == 3) {
 			qp->hp.m_curRate = dev->GetDataRate();
@@ -683,7 +688,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
 			printf("[DCQCN_CNP_CHECK] %.3fms node=%u cnp=%u cc_mode=%u\n",
 				Simulator::Now().GetSeconds() * 1000.0, m_node->GetId(), cnp, m_cc_mode);
 		}
-		if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN
+		if (UsesDcqcn()) { // 复用 DCQCN
 			cnp_received_mlx(qp);
 		}
 	}
@@ -772,7 +777,7 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp) {
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp) {
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
-	if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN
+	if (UsesDcqcn()) { // 复用 DCQCN
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
 		Simulator::Cancel(qp->mlx.m_rpTimer);
@@ -879,7 +884,7 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 	if (PowerTCPEnabled)
 		qp->rates[qp->snd_nxt] = Simulator::Now().GetNanoSeconds();
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
-	if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN
+	if (UsesDcqcn()) { // 复用 DCQCN
 		RateIncByteCounterMlx(qp, qp->lastPayloadSize);
 	}
 

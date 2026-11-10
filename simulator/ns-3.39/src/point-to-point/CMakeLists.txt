@@ -42,7 +42,9 @@ build_lib(
     model/epfc.cc
     model/grc-wan-routing.cc
     model/grc-settings.cc
+    model/themis-gateway.cc
     helper/grc-helper.cc
+    helper/themis-helper.cc
   HEADER_FILES
     ${mpi_headers}
     helper/point-to-point-helper.h
@@ -70,7 +72,9 @@ build_lib(
     model/epfc.h
     model/grc-wan-routing.h
     model/grc-settings.h
+    model/themis-gateway.h
     helper/grc-helper.h
+    helper/themis-helper.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}
                     ${internet}

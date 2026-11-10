@@ -155,6 +155,24 @@ void SwitchNode::InitializeGrc(uint32_t dc, const std::map<uint32_t, uint32_t>& 
 	m_grc->Init(this, dc, routes);
 }
 
+Ptr<ThemisGateway> SwitchNode::InitializeThemis(uint32_t dc,
+                                             const std::map<uint32_t, uint32_t>& hostIpToDc,
+                                             const ThemisSettings& settings) {
+	NS_ABORT_MSG_IF(m_themis, "THEMIS initialized twice");
+	m_themis = CreateObject<ThemisGateway>();
+	m_themis->Configure(this, dc, hostIpToDc, settings,
+	                    MakeCallback(&SwitchNode::SendToDev, this));
+	return m_themis;
+}
+
+void SwitchNode::DoDispose() {
+	if (m_themis) {
+		m_themis->Dispose();
+		m_themis = nullptr;
+	}
+	Node::DoDispose();
+}
+
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch) {
 	// look up entries
 	Ptr<Packet> cp = p->Copy();
@@ -359,6 +377,8 @@ void SwitchNode::ClearTable() {
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch) {
+    if (m_themis && m_themis->PacketIn(device->GetIfIndex(), packet, ch))
+        return true;
     if (m_ccMode == 18 && m_grc) {
         m_grc->RouteInput(packet, ch);
         return true;
@@ -381,6 +401,9 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
 }
 
 void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
+	// Internal loop FIFO admission is paired with ThemisGateway's finite byte
+	// accounting, not the normal MMU. Do not mark dummy/loop traffic with ECN.
+	if (m_themis && m_themis->IsLoopPort(ifIndex)) return;
 	InterfaceTag t;
 	p->PeekPacketTag(t);
 
@@ -454,6 +477,8 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
         //CheckAndSendPfc(inDev, qIndex);
 		CheckAndSendResume(inDev, qIndex);
 	}
+	// PNP also sees CE marks just added by this ESW's own egress queue.
+	if (m_themis) m_themis->NotifyDequeue(ifIndex, p);
 	if (1) {
 		uint8_t* buf = p->GetBuffer();
 		if (buf[PppHeader::GetStaticSize() + 9] == 0x11) { // udp packet

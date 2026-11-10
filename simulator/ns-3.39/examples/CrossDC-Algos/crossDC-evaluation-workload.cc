@@ -31,6 +31,7 @@
 #include <filesystem>
 #include "ns3/core-module.h"
 #include "ns3/grc-helper.h"
+#include "ns3/themis-helper.h"
 #include "ns3/qbb-helper.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/applications-module.h"
@@ -875,6 +876,7 @@ int main(int argc, char *argv[])
 
 	uint32_t algorithm = 3;
 	std::map<std::string, std::string> grcParameters;
+	std::map<std::string, std::string> themisParameters;
 	uint32_t windowCheck = 1;
 	uint32_t gatewayTypeOverride = UINT32_MAX;
 	std::string confFile = "examples/CrossDC-Algos/config/workload/config-testbed.txt";
@@ -1100,6 +1102,9 @@ int main(int argc, char *argv[])
 		}
 		else if (key.rfind("GRC_", 0) == 0) {
 			conf >> grcParameters[key.substr(4)];
+		}
+		else if (key.rfind("THEMIS_", 0) == 0) {
+			conf >> themisParameters[key.substr(7)];
 		}
 		else if (key.compare("CC_MODE") == 0) {
 			conf >> cc_mode;
@@ -1887,6 +1892,7 @@ int main(int argc, char *argv[])
 			else if (algorithm == 10) algo_suffix = "dctcp";
 			else if (algorithm == 16) algo_suffix = "dciext";  // DCI-Ext uses ccMode=16
 			else if (algorithm == 18) algo_suffix = "grc";
+			else if (algorithm == 19) algo_suffix = "themis";
 			else algo_suffix = "unknown";
 			
 			queryFlowFctFile = "/home/shemuping/newCode/ns3-FRP/results/workload/fct/query-flow-" + algo_suffix + ".txt";
@@ -2146,6 +2152,10 @@ int main(int argc, char *argv[])
 		GrcHelper::Install(cc_mode, n, serverAddress, g_hostToDc, g_switchToDc,
 		                   dci_switches, grcParameters, randomSeed);
 
+	if (cc_mode == 19)
+		ThemisHelper::Install(cc_mode, n, serverAddress, g_hostToDc, g_switchToDc,
+		                      dci_switches, themisParameters);
+
 	Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 	// Ptr<OutputStreamWrapper> routingStream = Create<OutputStreamWrapper> (&std::cout);
 	// globalRoutingHelper.PrintRoutingTableAt (Seconds (0.0), n.Get(0), routingStream);
@@ -2218,6 +2228,7 @@ int main(int argc, char *argv[])
 		else if (algorithm == 16) algo_name = "dciext";
 		else if (algorithm == 17) algo_name = "epfc";
 		else if (algorithm == 18) algo_name = "grc";
+		else if (algorithm == 19) algo_name = "themis";
 		else algo_name = "unknown";
 		
 		// 构建文件名: bottleneck_{algo}_{cdf}_load{load}.txt
