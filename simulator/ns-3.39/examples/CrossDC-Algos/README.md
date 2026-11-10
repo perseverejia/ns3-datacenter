@@ -272,8 +272,10 @@ H0、H1 同时跨域发送到 H4，竞争 H4 的接收链路；H6→H5 是 DC1 �
 查询流：[query-flow-testbed.txt](config/query-flow/query-flow-testbed.txt)。
 
 DC0 包含 H0、H1，DC1 包含 H2、H3；DCI 为 SW6、SW7。
-所有链路带宽均为 100 Gbps；SW6↔SW7 的单向传播时延为 5 ms，
-其余链路为 1.5 μs。两条流都发往 H2，共享 SW5→H2 的接收链路。
+服务器接入链路 H0/H1↔SW4、H2/H3↔SW5 均为 **40 Gbps**；
+SW4↔SW6、SW5↔SW7 及 SW6↔SW7 均为 **100 Gbps**。
+SW6↔SW7 的单向传播时延为 5 ms，其余链路为 1.5 μs。
+两条流都发往 H2，共享 SW5→H2 的 40 Gbps 接收链路。
 
 配置的 `START_TIME=0.005 s`。因此文件中的 `0.000 s`、`0.005 s`
 分别对应仿真时间 **5 ms、10 ms**，不是 0 ms、5 ms。
@@ -285,12 +287,12 @@ DC0 包含 H0、H1，DC1 包含 H2、H3；DCI 为 SW6、SW7。
 
 ### 运行与结果口径
 
-四个场景的仿真上限均为 2 s。前三个场景开启查询流完成后自动停止；testbed 运行到配置的停止时间。
+四个场景的仿真上限均为 2 s，均开启查询流完成后自动停止。
 FCT 从各条流的实际开始时间计起，域内和跨域流分别统计；到停止时间仍未完成的流单独标记，
 不能只用已完成流计算均值来代表全部流。
 
-DCI-Ext 需要显式指定部署节点。本轮比较在临时场景配置中仅补正以下节点编号，
-同一场景的五种算法共用该配置，未修改原始拓扑和流文件：
+DCI-Ext 和 ATC 需要显式指定部署节点。批量脚本按场景覆盖以下节点编号，
+同一场景的五种算法共用算法及端侧参数，并监控本场景的全部交换机：
 
 | 场景 | 发送侧 DCI | 接收侧 DCI |
 | --- | --- | --- |
@@ -298,6 +300,3 @@ DCI-Ext 需要显式指定部署节点。本轮比较在临时场景配置中仅
 | motivation1 | SW14 | SW15 |
 | motivation2 | SW14 | SW15 |
 | testbed | SW6 | SW7 |
-
-本轮运行配置和逐流数据位于 [results/dciext-vs-grc/](results/dciext-vs-grc/)，
-三算法对比图位于 [plots/dciext-vs-grc/fct-by-domain.png](plots/dciext-vs-grc/fct-by-domain.png)。
