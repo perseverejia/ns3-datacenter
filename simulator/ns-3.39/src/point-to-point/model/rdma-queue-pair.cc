@@ -32,6 +32,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_pg = pg;
 	m_ipid = 0;
 	m_win = 0;
+	m_winFloor = 0;
 	m_baseRtt = 0;
 	m_max_rate = 0;
 	m_var_win = false;
@@ -106,6 +107,17 @@ void RdmaQueuePair::SetAppNotifyCallback(Callback<void> notifyAppFinish) {
 	m_notifyAppFinish = notifyAppFinish;
 }
 
+void RdmaQueuePair::DoDispose() {
+	for (auto* event : {&mlx.m_eventUpdateAlpha, &mlx.m_eventDecreaseRate,
+	                    &mlx.m_rpTimer, &txRate.m_eventId}) {
+		if (!event->IsExpired()) Simulator::Remove(*event);
+		*event = EventId();
+	}
+	m_notifyAppFinish.Nullify();
+	rates.clear();
+	Object::DoDispose();
+}
+
 uint64_t RdmaQueuePair::GetBytesLeft() {
 	return m_size >= snd_nxt ? m_size - snd_nxt : 0;
 }
@@ -128,6 +140,8 @@ uint32_t RdmaQueuePair::GetHash(void) {
 void RdmaQueuePair::Acknowledge(uint64_t ack) {
 	if (ack > snd_una) {
 		snd_una = ack;
+		if (snd_nxt < snd_una)
+			snd_nxt = snd_una;
 	}
 }
 
@@ -140,6 +154,8 @@ bool RdmaQueuePair::IsWinBound() {
 	if (m_epfcPauseUntil > Simulator::Now())
 		return true;
 	uint64_t w = GetWin();
+	if (w != 0 && w < m_winFloor)
+		w = m_winFloor;
 	return w != 0 && GetOnTheFly() >= w;
 }
 
@@ -266,6 +282,21 @@ void RdmaQueuePairGroup::AddRxQp(Ptr<RdmaRxQueuePair> rxQp) {
 
 void RdmaQueuePairGroup::Clear(void) {
 	m_qps.clear();
+	MaybeShrink();
+}
+
+void RdmaQueuePairGroup::MaybeShrink() {
+	if (m_qps.empty())
+		std::vector<Ptr<RdmaQueuePair>>().swap(m_qps);
+	else if (m_qps.capacity() > 1024 && m_qps.size() * 4 < m_qps.capacity())
+		std::vector<Ptr<RdmaQueuePair>>(m_qps.begin(), m_qps.end()).swap(m_qps);
+}
+
+void RdmaQueuePairGroup::DoDispose() {
+	for (const auto& qp : m_qps)
+		if (qp) qp->Dispose();
+	Clear();
+	Object::DoDispose();
 }
 
 }

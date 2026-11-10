@@ -24,6 +24,7 @@ public:
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
+	uint32_t m_winFloor; // one recovery chunk when go-back-to-zero is enabled
 	uint64_t m_baseRtt; // base RTT of this qp
 	DataRate m_max_rate; // max rate
 	bool m_var_win; // variable window size
@@ -151,6 +152,9 @@ public:
 	bool IsFinished();
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 	uint32_t incastFlow;
+
+protected:
+	void DoDispose() override;
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair
@@ -169,7 +173,7 @@ public:
 	uint16_t m_ipid;
 	uint32_t ReceiverNextExpectedSeq;
 	Time m_nackTimer;
-	int32_t m_milestone_rx;
+	uint32_t m_milestone_rx;
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	uint64_t m_recv_bytes; // 累计按序接收的 payload 字节数（用于接收侧 goodput 统计）
@@ -197,6 +201,10 @@ public:
 	void AddQp(Ptr<RdmaQueuePair> qp);
 	//void AddRxQp(Ptr<RdmaRxQueuePair> rxQp);
 	void Clear(void);
+	void MaybeShrink();
+
+protected:
+	void DoDispose() override;
 };
 
 }

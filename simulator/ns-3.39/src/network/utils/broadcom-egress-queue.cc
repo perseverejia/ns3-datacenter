@@ -54,6 +54,7 @@ namespace ns3 {
 		m_bytesInQueueTotal = 0;
 		m_rxBytes= 0;
 		m_rrlast = 0;
+		numTxBytes = 0;
 		for (uint32_t i = 0; i < fCnt; i++)
 		{
 			m_bytesInQueue[i] = 0;

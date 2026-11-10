@@ -61,6 +61,7 @@ public:
 	void RecoverQueue(uint32_t i);
 	void EnqueueHighPrioQ(Ptr<Packet> p);
 	void CleanHighPrio(TracedCallback<Ptr<const Packet>, uint32_t> dropCb);
+	void CompactFinishedQps();
 
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceRdmaEnqueue;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceRdmaDequeue;
@@ -68,6 +69,9 @@ public:
 	Ptr<QbbNetDevice> qb_dev;
 	bool dummy_paused[8];
 	uint64_t hostDequeueIndex;
+
+protected:
+	void DoDispose() override;
 };
 
 /**
@@ -247,18 +251,6 @@ protected:
   EventId  m_nextSend;		//< The next send event
   /* State variable for rate-limited queues */
 
-  //qcn
-
-  struct ECNAccount{
-	  Ipv4Address source;
-	  uint32_t qIndex;
-	  uint32_t port;
-	  uint8_t ecnbits;
-	  uint16_t qfb;
-	  uint16_t total;
-  };
-
-  std::vector<ECNAccount> *m_ecn_source;
   
   // 网卡处理延迟（接收端）
   Time m_nicDelay;  // 从物理链路到协议栈的处理时延

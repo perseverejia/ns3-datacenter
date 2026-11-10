@@ -74,6 +74,9 @@ TypeId RdmaEgressQueue::GetTypeId (void)
 RdmaEgressQueue::RdmaEgressQueue() {
 	m_rrlast = 0;
 	m_qlast = 0;
+	hostDequeueIndex = 0;
+	for (uint32_t i = 0; i < qCnt; ++i)
+		dummy_paused[i] = false;
 	m_ackQ = CreateObject<DropTailQueue<Packet>>();
 	m_ackQ->SetAttribute("MaxSize", QueueSizeValue (QueueSize (BYTES, 0xffffffff))); // queue limit is on a higher level, not here
 }
@@ -102,11 +105,46 @@ Ptr<Packet> RdmaEgressQueue::DequeueQindex(int qIndex) {
 	}
 	return 0;
 }
+void RdmaEgressQueue::CompactFinishedQps() {
+	auto& qps = m_qpGrp->m_qps;
+	const uint32_t oldCount = qps.size();
+	if (oldCount == 0) {
+		m_rrlast = 0;
+		m_qpGrp->MaybeShrink();
+		return;
+	}
+	uint32_t nextEligible = 0;
+	bool found = false;
+	for (uint32_t step = 1; step <= oldCount; ++step) {
+		uint32_t i = (m_rrlast % oldCount + step) % oldCount;
+		if (!qps[i]->IsFinished()) {
+			nextEligible = i;
+			found = true;
+			break;
+		}
+	}
+	uint32_t nextIdx = 0, nextEligibleNewIdx = 0;
+	for (uint32_t i = 0; i < oldCount; ++i) {
+		auto qp = qps[i];
+		if (qp->IsFinished()) {
+			// Timed flows may still need their final ACK/completion callback.
+			if (qp->snd_una >= qp->m_size) qp->Dispose();
+			continue;
+		}
+		if (found && i == nextEligible) nextEligibleNewIdx = nextIdx;
+		qps[nextIdx++] = qp;
+	}
+	qps.resize(nextIdx);
+	m_qpGrp->MaybeShrink();
+	m_rrlast = qps.empty() ? 0 : (nextEligibleNewIdx + qps.size() - 1) % qps.size();
+}
+
 int RdmaEgressQueue::GetNextQindex(bool paused[]) {
 	bool found = false;
 	uint32_t qIndex;
 	if (!paused[ack_q_idx] && m_ackQ->GetNPackets() > 0)
 		return -1;
+	CompactFinishedQps();
 
 	// no pkt in highest priority queue, do rr for each qp
 	int res = -1024;
@@ -115,7 +153,6 @@ int RdmaEgressQueue::GetNextQindex(bool paused[]) {
 		hostDequeueIndex++;
 		if (hostDequeueIndex % 2) {
 			uint32_t fcount = m_qpGrp->GetN();
-			uint32_t min_finish_id = 0xffffffff;
 			for (qIndex = 1; qIndex <= fcount; qIndex++) {
 				uint32_t idx = (qIndex + m_rrlast) % fcount;
 				Ptr<RdmaQueuePair> qp = m_qpGrp->Get(idx);
@@ -124,22 +161,7 @@ int RdmaEgressQueue::GetNextQindex(bool paused[]) {
 						continue;
 					res = idx;
 					break;
-				} else if (qp->IsFinished()) {
-					min_finish_id = idx < min_finish_id ? idx : min_finish_id;
 				}
-			}
-
-			// clear the finished qp
-			if (min_finish_id < 0xffffffff) {
-				int nxt = min_finish_id;
-				auto &qps = m_qpGrp->m_qps;
-				for (int i = min_finish_id + 1; i < fcount; i++) if (!qps[i]->IsFinished()) {
-						if (i == res) // update res to the idx after removing finished qp
-							res = nxt;
-						qps[nxt] = qps[i];
-						nxt++;
-					}
-				qps.resize(nxt);
 			}
 
 			if (res != -1024) {
@@ -189,6 +211,15 @@ void RdmaEgressQueue::CleanHighPrio(TracedCallback<Ptr<const Packet>, uint32_t> 
 		Ptr<Packet> p = m_ackQ->Dequeue();
 		dropCb(p, 0);
 	}
+}
+
+void RdmaEgressQueue::DoDispose() {
+	m_rdmaGetNxtPkt.Nullify();
+	qb_dev = nullptr;
+	if (m_ackQ) m_ackQ->Dispose();
+	m_ackQ = nullptr;
+	m_qpGrp = nullptr;
+	Object::DoDispose();
 }
 
 /******************
@@ -250,7 +281,6 @@ QbbNetDevice::GetTypeId(void)
 QbbNetDevice::QbbNetDevice()
 {
 	NS_LOG_FUNCTION(this);
-	m_ecn_source = new std::vector<ECNAccount>;
 	m_rdmaEQ = CreateObject<RdmaEgressQueue>();
 	m_rdmaEQ->qb_dev = this;
 
@@ -274,6 +304,16 @@ void
 QbbNetDevice::DoDispose()
 {
 	NS_LOG_FUNCTION(this);
+	if (!m_nextSend.IsExpired()) Simulator::Remove(m_nextSend);
+	m_nextSend = EventId();
+	m_rdmaReceiveCb.Nullify();
+	m_rdmaLinkDownCb.Nullify();
+	m_rdmaPktSent.Nullify();
+	if (m_rdmaEQ) m_rdmaEQ->Dispose();
+	m_rdmaEQ = nullptr;
+	m_queue = nullptr;
+	m_queueFifo = nullptr;
+	m_channel = nullptr;
 
 	PointToPointNetDevice::DoDispose();
 }

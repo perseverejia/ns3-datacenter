@@ -18,6 +18,13 @@ TypeId RdmaDriver::GetTypeId (void)
 RdmaDriver::RdmaDriver(){
 }
 
+void RdmaDriver::DoDispose() {
+	m_node = nullptr;
+	if (m_rdma) m_rdma->Dispose();
+	m_rdma = nullptr;
+	Object::DoDispose();
+}
+
 void RdmaDriver::Init(void){
 	Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4> ();
 	#if 0

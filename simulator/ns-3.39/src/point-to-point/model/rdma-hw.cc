@@ -205,6 +205,25 @@ TypeId RdmaHw::GetTypeId (void)
 	return tid;
 }
 
+void RdmaHw::DoDispose() {
+	for (const auto& entry : m_qpMap)
+		if (entry.second) entry.second->Dispose();
+	m_qpMap.clear();
+	for (const auto& entry : m_rxQpMap)
+		if (entry.second) entry.second->Dispose();
+	m_rxQpMap.clear();
+	for (auto& nic : m_nic) {
+		nic.dev = nullptr;
+		if (nic.qpGrp) nic.qpGrp->Dispose();
+		nic.qpGrp = nullptr;
+	}
+	m_nic.clear();
+	m_rtTable.clear();
+	m_qpCompleteCallback.Nullify();
+	m_node = nullptr;
+	Object::DoDispose();
+}
+
 RdmaHw::RdmaHw() {
 	m_epfcRttUs = 30.0; // ePFC (ccMode=17)：内部流 RTT 默认值（workload 可覆盖）
 }
@@ -265,6 +284,7 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 	qp->SetSize(size);
 	qp->SetWin(win);
+	qp->m_winFloor = m_backto0 ? m_chunk : 0;
 	qp->SetBaseRtt(baseRtt);
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
@@ -383,16 +403,18 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 		rxQp->m_ecn_source.qfb++;
 	}
 	rxQp->m_ecn_source.total++;
-	rxQp->m_milestone_rx = m_ack_interval;
+	if (rxQp->m_milestone_rx == 0 && m_ack_interval > 0)
+		rxQp->m_milestone_rx = m_ack_interval;
 
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 	// 按序到达时累加接收字节（用于接收侧 goodput 统计）
 	// x==1: 按序+需发ACK; x==5: 按序+无需ACK
 	// x==2/x==4: 乱序(不累加,等重传补洞); x==3: 重复包(不累加)
 	if (x == 1 || x == 5) {
-		rxQp->m_recv_bytes += payload_size;
+		rxQp->m_recv_bytes = std::max(rxQp->m_recv_bytes,
+		                            static_cast<uint64_t>(rxQp->ReceiverNextExpectedSeq));
 	}
-	if (x == 1 || x == 2) { //generate ACK or NACK
+	if (m_ack_interval > 0 && (x == 1 || x == 2 || x == 3)) { // ACK, NACK, or duplicate ACK
 		qbbHeader seqh;
 		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
 		seqh.SetPG(ch.udp.pg);
@@ -408,7 +430,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 		Ipv4Header head;	// Prepare IPv4 header
 		head.SetDestination(Ipv4Address(ch.sip));
 		head.SetSource(Ipv4Address(ch.dip));
-		head.SetProtocol(x == 1 ? 0xFC : 0xFD); //ack=0xFC nack=0xFD
+		head.SetProtocol(x == 2 ? 0xFD : 0xFC); //ack=0xFC nack=0xFD
 		head.SetTtl(64);
 		head.SetPayloadSize(newp->GetSize());
 		head.SetIdentification(rxQp->m_ipid++);
@@ -580,7 +602,7 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 	// get qp
 	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, udpport, qIndex);
 	if (qp == NULL)
-		std::cout << "ERROR: QCN NIC cannot find the flow\n";
+		return 0;
 	// get nic
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
@@ -633,27 +655,27 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
 			printf("[DCQCN_QP_MISS] %.3fms node=6 sip=0x%08x dport=%u pg=%u cnp=%u\n",
 				Simulator::Now().GetSeconds() * 1000.0, ch.sip, port, qIndex, cnp);
 		}
-		std::cout << "ERROR: " << "node:" << m_node->GetId() << ' ' << (ch.l3Prot == 0xFC ? "ACK" : "NACK") << " NIC cannot find the flow\n";
 		return 0;
 	}
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
-	if (m_ack_interval == 0)
-		std::cout << "ERROR: shouldn't receive ack\n";
-	else {
-		if (!m_backto0) {
+	if (m_ack_interval > 0) {
+		// A stale NACK must not rewind a recovery that has already advanced.
+		// Keep processing its ECN bit below: gateways also use ACK seq=0 for CNPs.
+		if (seq >= qp->snd_una) {
+			if (m_backto0 && m_chunk > 0 && seq < qp->m_size)
+				seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(seq);
-		} else {
-			uint32_t goback_seq = seq / m_chunk * m_chunk;
-			qp->Acknowledge(goback_seq);
+			if (ch.l3Prot == 0xFD)
+				RecoverQueue(qp);
 		}
 		if (qp->IsFinished()) {
 			QpComplete(qp);
+			dev->TriggerTransmit();
+			return 0;
 		}
 	}
-	if (ch.l3Prot == 0xFD) // NACK
-		RecoverQueue(qp);
 
 	// handle cnp
 	if (cnp) {
@@ -702,22 +724,26 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 	uint32_t expected = q->ReceiverNextExpectedSeq;
 	if (seq == expected) {
 		q->ReceiverNextExpectedSeq = expected + size;
+		if (m_ack_interval == 0)
+			return 5;
 		if (q->ReceiverNextExpectedSeq >= q->m_milestone_rx) {
-			q->m_milestone_rx += m_ack_interval;
+			uint32_t intervals = (q->ReceiverNextExpectedSeq - q->m_milestone_rx) / m_ack_interval + 1;
+			q->m_milestone_rx += intervals * m_ack_interval;
 			return 1; //Generate ACK
-		} else if (q->ReceiverNextExpectedSeq % m_chunk == 0) {
+		} else if (m_chunk > 0 && q->ReceiverNextExpectedSeq % m_chunk == 0) {
 			return 1;
 		} else {
 			return 5;
 		}
 	} else if (seq > expected) {
+		if (m_ack_interval == 0)
+			return 4; // Out of order, with feedback disabled; not in-order goodput.
 		// Generate NACK
-		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected) {
+		uint32_t nackSeq = m_backto0 && m_chunk > 0 ? expected / m_chunk * m_chunk : expected;
+		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != nackSeq) {
 			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
-			q->m_lastNACK = expected;
-			if (m_backto0) {
-				q->ReceiverNextExpectedSeq = q->ReceiverNextExpectedSeq / m_chunk * m_chunk;
-			}
+			q->m_lastNACK = nackSeq;
+			q->ReceiverNextExpectedSeq = nackSeq;
 			return 2;
 		} else
 			return 4;
@@ -850,7 +876,8 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 //	SeqTsHeader seqTs;
 //	pkt->PeekHeader(seqTs);
 	uint32_t seq = qp->snd_nxt;
-	qp->rates[qp->snd_nxt] = Simulator::Now().GetNanoSeconds();
+	if (PowerTCPEnabled)
+		qp->rates[qp->snd_nxt] = Simulator::Now().GetNanoSeconds();
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
 	if (m_cc_mode == 1 || m_cc_mode == 15 || m_cc_mode == 16 || m_cc_mode == 17 || m_cc_mode == 18) { // ATC/DCI-Ext/ePFC/GRC 复用 DCQCN
 		RateIncByteCounterMlx(qp, qp->lastPayloadSize);
@@ -1002,8 +1029,8 @@ void RdmaHw::ScheduleDecreaseRateMlx(Ptr<RdmaQueuePair> q, uint32_t delta) {
 
 void RdmaHw::RateIncEventTimerMlx(Ptr<RdmaQueuePair> q) {
 	q->mlx.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset), &RdmaHw::RateIncEventTimerMlx, this, q);
-	RateIncEventMlx(q, q->mlx.m_rpTimeStage);
 	q->mlx.m_rpTimeStage++;
+	RateIncEventMlx(q, q->mlx.m_rpTimeStage);
 }
 void RdmaHw::RateIncByteCounterMlx(Ptr<RdmaQueuePair> q, uint32_t payloadBytes) {
 	if (!m_dcqcnByteRecoveryEnabled || !q->mlx.m_byteRecoveryActive || payloadBytes == 0) {
@@ -1012,18 +1039,23 @@ void RdmaHw::RateIncByteCounterMlx(Ptr<RdmaQueuePair> q, uint32_t payloadBytes) 
 	q->mlx.m_rpByteCount += payloadBytes;
 	while (q->mlx.m_rpByteCount >= m_dcqcnByteRecoveryThreshold) {
 		q->mlx.m_rpByteCount -= m_dcqcnByteRecoveryThreshold;
-		RateIncEventMlx(q, q->mlx.m_rpCountStage);
 		q->mlx.m_rpCountStage++;
+		RateIncEventMlx(q, q->mlx.m_rpCountStage);
 	}
 }
 void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q, uint32_t stage) {
 	// check which increase phase: fast recovery, active increase, hyper increase
-	if (stage < m_rpgThreshold) { // fast recovery
+	uint32_t upperStage = stage, lowerStage = stage;
+	if (m_dcqcnByteRecoveryEnabled && q->mlx.m_byteRecoveryActive) {
+		upperStage = std::max(q->mlx.m_rpTimeStage, q->mlx.m_rpCountStage);
+		lowerStage = std::min(q->mlx.m_rpTimeStage, q->mlx.m_rpCountStage);
+	}
+	if (upperStage < m_rpgThreshold) { // fast recovery
 		FastRecoveryMlx(q);
-	} else if (stage == m_rpgThreshold) { // active increase
-		ActiveIncreaseMlx(q);
-	} else { // hyper increase
+	} else if (lowerStage > m_rpgThreshold) { // hyper increase
 		HyperIncreaseMlx(q);
+	} else { // active increase
+		ActiveIncreaseMlx(q);
 	}
 	// ePFC (ccMode=17)：CCF 设速窗口（2×RTT_internal）内增速钳制在 rv——防爬升兜底；
 	// 设速本体在 EpfcCcfRecv（m_rate = tgt = rv）；CNP 降速不受影响
@@ -1200,7 +1232,7 @@ void RdmaHw::UpdateRateHp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch
 						new_rate = qp->m_max_rate;
 #if PRINT_LOG
 					if (print)
-						printf(" u=%.6lf U=%.3lf dt=%u max_c=%.3lf", qp->hp.u, U, dt, max_c);
+						printf(" u=%.6lf U=%.3lf dt=%lu max_c=%.3lf", qp->hp.u, U, dt, max_c);
 #endif
 #if PRINT_LOG
 					if (print)
@@ -1490,7 +1522,7 @@ void RdmaHw::HandleAckDctcp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 	qp->dctcp.m_ecnCnt += (cnp > 0);
 	if (ack_seq > qp->dctcp.m_lastUpdateSeq) { // if full RTT feedback is ready, do alpha update
 #if PRINT_LOG
-		printf("%lu %s %08x %08x %u %u [%u,%u,%u] %.3lf->", Simulator::Now().GetTimeStep(), "alpha", qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, qp->dctcp.m_lastUpdateSeq, ch.ack.seq, qp->snd_nxt, qp->dctcp.m_alpha);
+		printf("%lu %s %08x %08x %u %u [%u,%u,%lu] %.3lf->", Simulator::Now().GetTimeStep(), "alpha", qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, qp->dctcp.m_lastUpdateSeq, ch.ack.seq, qp->snd_nxt, qp->dctcp.m_alpha);
 #endif
 		new_batch = true;
 		if (qp->dctcp.m_lastUpdateSeq == 0) { // first RTT
@@ -1501,7 +1533,8 @@ void RdmaHw::HandleAckDctcp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 			qp->dctcp.m_alpha = (1 - m_g) * qp->dctcp.m_alpha + m_g * frac;
 			qp->dctcp.m_lastUpdateSeq = qp->snd_nxt;
 			qp->dctcp.m_ecnCnt = 0;
-			qp->dctcp.m_batchSizeOfAlpha = (qp->snd_nxt - ack_seq) / m_mtu + 1;
+			uint64_t unacked = qp->snd_nxt > ack_seq ? qp->snd_nxt - ack_seq : 0;
+			qp->dctcp.m_batchSizeOfAlpha = unacked / m_mtu + 1;
 #if PRINT_LOG
 			printf("%.3lf F:%.3lf", qp->dctcp.m_alpha, frac);
 #endif

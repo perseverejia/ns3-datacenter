@@ -498,8 +498,14 @@ uint32_t ip_to_node_id(Ipv4Address ip) {
 void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 	uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
 	uint64_t base_rtt = pairRtt[sid][did], b = pairBw[sid][did];
-	uint32_t total_bytes = q->m_size + ((q->m_size - 1) / packet_payload_size + 1) * (CustomHeader::GetStaticWholeHeaderSize() - IntHeader::GetStaticSize()); // translate to the minimum bytes required (with header but no INT)
-	uint64_t standalone_fct = base_rtt + total_bytes * 8000000000lu / b;
+	uint32_t header_bytes = CustomHeader::GetStaticWholeHeaderSize() - IntHeader::GetStaticSize();
+	uint64_t full_packets = q->m_size / packet_payload_size;
+	uint32_t tail_payload_bytes = q->m_size % packet_payload_size;
+	uint64_t full_packet_delay = std::llround(8000000000.0L * (packet_payload_size + header_bytes) / b);
+	uint64_t serialization_delay = full_packets * full_packet_delay;
+	if (tail_payload_bytes > 0)
+		serialization_delay += std::llround(8000000000.0L * (tail_payload_bytes + header_bytes) / b);
+	uint64_t standalone_fct = base_rtt + serialization_delay;
 	
 	// Check if this is a query flow by matching sip, dip, and dport
 	bool is_query = false;
@@ -2080,8 +2086,7 @@ int main(int argc, char *argv[])
 			if (i == j)
 				continue;
 			uint64_t delay = pairDelay[n.Get(i)][n.Get(j)];
-			uint64_t txDelay = pairTxDelay[n.Get(i)][n.Get(j)];
-			uint64_t rtt = delay * 2 + txDelay;
+			uint64_t rtt = delay * 2;
 			uint64_t bw = pairBw[i][j];
 			uint64_t bdp = rtt * bw / 1000000000 / 8;
 			pairBdp[n.Get(i)][n.Get(j)] = bdp;
@@ -2177,6 +2182,8 @@ int main(int argc, char *argv[])
 	g_totalQueryFlows = queryFlowCount;
 	std::cout << "[QUERY FLOW] Completion target: " << g_totalQueryFlows << std::endl;
 	std::cout << "[WORKLOAD] Total flows: " << flows.size() << std::endl;
+	free_cdf(cdfTable);
+	delete cdfTable;
 
 	topof.close();
 	tracef.close();

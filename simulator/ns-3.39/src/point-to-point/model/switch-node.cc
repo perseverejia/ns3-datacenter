@@ -174,7 +174,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch) {
 	union {
 		uint8_t u8[4 + 4 + 2 + 2];
 		uint32_t u32[3];
-	} buf;
+	} buf = {};
 	buf.u32[0] = ih.GetSource().Get();
 	buf.u32[1] = ih.GetDestination().Get();
 	if (ih.GetProtocol() == 0x6) {
@@ -186,6 +186,8 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch) {
 	}
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	else if (ch.l3Prot == 0xFF)
+		buf.u32[2] = ch.cnp.fid | ((uint32_t)ch.cnp.qIndex << 16);
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
 	// if (nexthops.size()>1){ std::cout << "selected " << idx << std::endl; }
@@ -256,6 +258,9 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch) {
 		else if (found) {
 			qIndex = priotag.GetPriority();
 			// std::cout << "using queue " << qIndex << std::endl;
+		}
+		else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD) {
+			qIndex = ch.ack.pg;
 		}
 		else {
 			qIndex = (ch.l3Prot == 0x06 ? 1 : ch.udp.pg); // For TCP/IP if the stack did not attach MyPriorityTag, put to queue 1.

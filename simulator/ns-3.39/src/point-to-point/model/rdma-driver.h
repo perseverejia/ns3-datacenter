@@ -37,6 +37,9 @@ public:
 
 	// callback when qp completes
 	void QpComplete(Ptr<RdmaQueuePair> q);
+
+protected:
+	void DoDispose() override;
 };
 
 } // namespace ns3
