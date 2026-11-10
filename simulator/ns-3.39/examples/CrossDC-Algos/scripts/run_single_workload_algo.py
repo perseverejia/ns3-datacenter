@@ -99,7 +99,6 @@ DUMP_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results/dump")
 RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
 PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
-TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
 PLOTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "plots")
 ANALYSIS_DIR = os.path.join(RESULTS_DIR, "analysis")
 ATC_ALGO_MODE = 15
@@ -687,7 +686,6 @@ def run_and_plot(args):
         topo_for_map = args.topology or read_config_value(content, "TOPOLOGY_FILE", "")
         port_map, topo_adj = parse_topology_adjacency(topo_for_map)
         pfc_by_flow = map_pfc_events_to_flows(pfc_events, port_map, topo_adj, sorted(tx_rates))
-        os.makedirs(TXRATE_DIR, exist_ok=True)
         tx_rate_output_file = os.path.join(
             PLOTS_DIR,
             f"workload_txrate_{args.algo_name.lower()}_cc{args.ccMode}_load{load_tag(load)}.png",
@@ -938,7 +936,7 @@ Examples:
     parser.add_argument("--timeout", type=int, default=180,
                         help="Timeout in seconds (default: 180 = 3 minutes)")
     parser.add_argument("--config", type=str, default=None,
-                        help="Config file path relative to ns-3.39 (default: config-testbed.txt)")
+                        help="Config file path relative to ns-3.39 (default: config-workload.txt)")
     parser.add_argument("--topology", type=str, default=None,
                         help="Override TOPOLOGY_FILE in config (relative to ns-3.39)")
     parser.add_argument("--query-flow", type=str, default=None,

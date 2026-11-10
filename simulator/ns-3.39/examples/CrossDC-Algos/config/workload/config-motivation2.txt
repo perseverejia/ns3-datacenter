@@ -1,0 +1,221 @@
+# ================================================================================
+# CrossDC-Algos motivation2 配置文件
+# 按算法分组配置，便于管理和对比实验
+# ================================================================================
+
+# ===== 基础配置 =====
+ENABLE_QCN 1
+PACKET_PAYLOAD_SIZE 1000
+SIMULATOR_STOP_TIME 2.0
+ERROR_RATE_PER_LINK 0.0000
+ENABLE_TRACE 1
+NIC_DELAY 15000
+
+# ===== 拓扑和流量文件 =====
+# 修改这里即可切换拓扑和查询流文件（无需改代码）
+TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-motivation.txt
+QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-motivation2.txt
+TRACE_FILE mix/trace.txt
+TRACE_OUTPUT_FILE mix/mix.tr
+
+# ===== 输出文件模板 =====
+FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/fct_{suffix}.txt
+PFC_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/pfc/pfc_{suffix}.txt
+QUERY_FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/query-flow-{suffix}.txt
+
+# ===== Workload 参数 =====
+CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
+LOAD 0
+LOAD_DC1 0
+START_TIME 0
+FLOW_LAUNCH_END_TIME 0.1
+QUERY_REQUEST_RATE 0
+REQUEST_SIZE 0
+INCAST 5
+QUERY_AUTO_STOP 1
+
+# ===== 混合流量模式 =====
+# 背景流已改为根据 CDF 自动生成，不再从文件加载
+
+# ===== 瓶颈队列监控 =====
+BOTTLENECK_MON_INTERVAL 40000
+
+# ================================================================================
+# [DCQCN] ccMode=1 - DCQCN 拥塞控制算法
+# ================================================================================
+CC_MODE 1
+ALPHA_RESUME_INTERVAL 1
+RATE_DECREASE_INTERVAL 4
+CLAMP_TARGET_RATE 1
+RP_TIMER 30
+EWMA_GAIN 0.00390625
+FAST_RECOVERY_TIMES 5
+DCQCN_BYTE_RECOVERY_ENABLED 1
+DCQCN_BYTE_RECOVERY_THRESHOLD 153600
+RATE_AI 50Mb/s
+RATE_HAI 100Mb/s
+MIN_RATE 100Mb/s
+
+# ================================================================================
+# [Bifrost] ccMode=12 - Bifrost 周期性 PFC 机制
+# 仅在 DCI 交换机上启用，其他交换机回退到 DCQCN
+# ================================================================================
+BIFROST_DEPLOY_SWITCH 15
+BIFROST_PFC_PERIOD 100
+
+# ================================================================================
+# [FRP] ccMode=13 - FRP 交换机周期性反馈
+# ================================================================================
+# FRP 使用 DCQCN 的基础参数，额外启用周期性反馈机制
+# 反馈周期固定为 40us（代码中硬编码）
+
+# ================================================================================
+# [ROCC] ccMode=14 - ROCC (FRP 变体)
+# ================================================================================
+# ROCC 使用与 FRP 相同的参数
+
+# ================================================================================
+# [ATC] ccMode=15 - ATC gateway 模式
+# 基于 DCQCN 端侧调速，在 DCI 交换机启用 gateway
+# ================================================================================
+GATEWAY_TYPE 0
+# motivation 发送侧 DCI：SW14；接收侧 DCI：SW15
+GATEWAY_SRC 1 14
+GATEWAY_DST 1 15
+MAX_ATC_VOQ_COUNT 128
+MAX_ATC_VOQ_RATE 100000000000
+ATC_VOQ_MAX_SIZE 1000000
+ATC_CNP_NOTIFY_INTERVAL 50
+ATC_MIN_RATE 100Mb/s
+ATC_RATE_DECREASE_INTERVAL 100
+ATC_RPG_TIME_RESET 2000
+ATC_CNP_ON_GLOBAL_CONGESTION 1
+ATC_VOQ_REACT_TO_CNP 1
+ATC_VOQ_INFLIGHT_RTT_US 3000
+
+# ================================================================================
+# [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
+# 发送方 DCI（节点 14）：表A DIP速度表 + 流观察期(20MiB→学费CNP→400us静默→查表)
+#                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 消费/查表连发
+# 接收方 DCI（节点 15）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
+# 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
+# ================================================================================
+# CNP 连发间隔（对应 1us alpha 更新窗口）
+DCIEXT_BURST_INTERVAL_US 4
+# 接收方反馈周期 T（us）：每 T 聚合表一/表二并发 0xFA，RTT 探测/可用带宽更新周期
+DCIEXT_T_US 500
+DCIEXT_SND_TICK_US 400
+# 期望跨域流排队时延 Dt（us）：RTT_t = RTT_base + Dt
+DCIEXT_DT_US 4
+# RTT 目标区间容差 sigma（us）：[RTT_t-sigma, RTT_t+sigma] 内直接用 ACK 速率
+DCIEXT_SIGMA_US 3
+# DIP 带宽 B（Gbps）：可用带宽上界（clamp）与下界 B/64
+DCIEXT_DIP_BW_G 40
+# 新流观察期（MiB，线速传输）：期满发学费 CNP 后按下方静默时长等待 alpha 衰减
+DCIEXT_OBSERVE_MB 20
+DCIEXT_SILENT_US 400
+# 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
+DCIEXT_AGING_PERIODS 4
+# motivation 发送侧 DCI：SW14，执行表A、观察期、ECN反馈及0xFA消费
+DCIEXT_SENDER_TAX_NODES 1 14
+
+# ================================================================================
+# [ePFC] ccMode=17 - extended PFC：PFC 的流级扩展（所有交换机打标 + 边缘执行）
+# 打标：入口超 PFC 动态门限×百分比 且 出口超阈值；或接收方 DCI 出口超阈值
+# 边缘：CCF 出端口对端是 host 或接收方 DCI；超额判据用内部 RTT
+# 接收方 DCI 列表：个数 + 节点 ID（motivation 拓扑为 SW15）
+# ================================================================================
+EPFC_INGRESS_MUL_PCT 50
+EPFC_EGRESS_THRESH_KB 256
+EPFC_DCI_TH_KB 256
+EPFC_RTT_INTERNAL_US 30
+EPFC_AGING_RTTS 2
+EPFC_UPDATE_T_US 1000
+EPFC_RX_DCI_NODES 1 15
+# 固定 rv 测试（Gbps，0=正常采样驱动）：>0 时 SW15 表 rv 钉死该值，
+# 窗内 MIN 棘轮旁路，CCF 双向改写为该值——隔离 rv 塌缩变量，单检门控执行层
+EPFC_FIXED_RV_G 20
+
+# ================================================================================
+# [GRC] ccMode=18 - DCI 交换机上的跨数据中心拥塞控制
+# 仅在模式18启用，DCI 节点与所属 DC 从现有拓扑自动识别
+# 端侧复用现有 DCQCN，沿用本配置的拓扑、流量与通用参数
+# ================================================================================
+GRC_WAN_EPOCH_US 1000
+# RTT 样本随 ACK 到达；以上周期用于样本汇总和速率更新
+# 以下依次为 RTT 平滑时间、采样表项超时、重传歧义过滤窗口（微秒）
+GRC_RTT_EWMA_US 1000
+GRC_RTT_ENTRY_TIMEOUT_US 30000
+GRC_RTT_RTO_FILTER_US 35000
+GRC_INV_DELTA 6291456
+GRC_BETA 0.3
+GRC_GUARANTEED_RATE_FACTOR 0.25
+GRC_W_MAX 4
+GRC_W_K_SYNC_INTERVAL_MS 30
+GRC_BASE_RTT_WINDOW_MS 10000
+GRC_TRACE_EVENTS 1
+GRC_LOG_DIR examples/CrossDC-Algos/results/grc
+
+# ================================================================================
+# [THEMIS] ccMode=19 - PNP/TRP，端侧复用现有 DCQCN
+# 反馈沿用本工程逐 ECN 包触发的方式，循环资源根据部署节点的拓扑派生
+# ================================================================================
+THEMIS_ALPHA 5
+THEMIS_BETA_US 500
+THEMIS_DUMMY_PACKET_BYTES 1024
+THEMIS_TRACE_EVENTS 1
+
+# ================================================================================
+# [HPCC] ccMode=3 - HPCC/PowerTCP 基于 INT 遥测
+# ================================================================================
+DCTCP_RATE_AI 1000Mb/s
+
+# ================================================================================
+# [PowerTCP] ccMode=4 - PowerTCP 速率调控（基于 INT 遥测）
+# PowerTCP 是 HPCC 的变体，使用到达率计算和 Power 指标进行速率控制
+# ================================================================================
+POWERTCP_ENABLED 0          # 是否启用 PowerTCP（ccMode=4 时自动为 1）
+POWERTCP_DELAY 0            # 是否启用 Theta-PowerTCP（基于 RTT 变化）
+
+# ================================================================================
+# [通用参数] - 多个算法共享的参数
+# ================================================================================
+L2_CHUNK_SIZE 4000
+L2_ACK_INTERVAL 1
+L2_BACK_TO_ZERO 0
+
+HAS_WIN 1
+GLOBAL_T 1
+VAR_WIN 1
+FAST_REACT 1
+U_TARGET 0.95
+MI_THRESH 5
+INT_MULTI 1
+MULTI_RATE 0
+SAMPLE_FEEDBACK 0
+PINT_LOG_BASE 1.05
+PINT_PROB 1.0
+
+RATE_BOUND 1
+ACK_HIGH_PRIO 0
+LINK_DOWN 0 0 0
+
+# ===== 交换机缓冲区配置 =====
+KMAX_MAP 4 25000000000 400 40000000000 800 50000000000 800 100000000000 1600
+KMIN_MAP 4 25000000000 100 40000000000 200 50000000000 200 100000000000 400
+PMAX_MAP 4 25000000000 0.2 40000000000 0.2 50000000000 0.2 100000000000 0.2
+BUFFER_SIZE 50
+# PFC 入口共享池（MiB）与动态门限系数
+PFC_INGRESS_POOL_MB 6
+PFC_INGRESS_ALPHA 0.125
+
+
+# ===== 队列监控 =====
+QLEN_MON_FILE mix/qlen-workload.txt
+ENABLE_QLEN_MON 1
+QLEN_MON_START 0
+QLEN_MON_END 2000000000
+# 指定监控队列长度的交换机 ID 列表（空格分隔）
+# 如果不指定或为空，则监控所有交换机
+# motivation 交换机：SW8–SW15
+QLEN_MON_SWITCHES 8 9 10 11 12 13 14 15

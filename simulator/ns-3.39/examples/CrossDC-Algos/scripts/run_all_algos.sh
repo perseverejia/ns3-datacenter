@@ -21,9 +21,12 @@ declare -a ALGOS=(
     "1:DCQCN"
     "3:HPCC"
     "7:Timely"
+    "12:Bifrost"
     "13:FRP"
     "14:ROCC"
-    "12:Bifrost"
+    "15:ATC"
+    "16:DCIEXT"
+    "17:EPFC"
     "18:GRC"
     "19:THEMIS"
 )

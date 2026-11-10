@@ -7,10 +7,6 @@
 ```
 CrossDC-Algos/
 ├── config/
-│   ├── flows/              # 流文件
-│   │   ├── flow-background.txt
-│   │   ├── flow-websearch.txt
-│   │   └── ...
 │   ├── topology/           # 拓扑文件
 │   │   ├── topology.txt
 │   │   ├── topology-testbed.txt
@@ -20,13 +16,12 @@ CrossDC-Algos/
 │   │   └── ...
 │   └── workload/           # 配置文件
 │       ├── config-workload.txt
-│       ├── config-bifrost.txt
+│       ├── config-testbed.txt
 │       └── ...
 ├── results/                # 仿真结果（运行时生成）
 │   ├── dump/               # 日志文件
 │   ├── fct/                # FCT 数据
-│   ├── pfc/                # PFC 数据
-│   └── txrate/             # TX Rate 数据
+│   └── pfc/                # PFC 数据
 ├── plots/                  # 画图结果（运行时生成）
 ├── scripts/                # 运行脚本
 │   └── run_single_workload_algo.py
@@ -40,13 +35,13 @@ CrossDC-Algos/
 | 1 | DCQCN | 标准 DCQCN |
 | 3 | HPCC | 基于 INT 遥测 |
 | 7 | Timely | 基于时间戳 |
-| 10 | DCTCP | DCTCP |
+| 8 | DCTCP | DCTCP |
 | 12 | Bifrost | DCI 交换机周期 PFC |
 | 13 | FRP | 交换机周期反馈 |
 | 14 | ROCC | FRP 变体 |
 | 15 | ATC | 基于 DCQCN 的 gateway 模式 |
 | 16 | DCIEXT | 接收方 DCI 交换机周期探测可用带宽（RTT 驱动，0xFA 反馈限速） |
-| 17 | EPFC | 接收方 excess 带宽反馈（CCF 设速 + 端口门控） |
+| 17 | EPFC | 接收方 excess 带宽反馈（CCF 设速 + 流级门控） |
 | 18 | GRC | DCI 网侧速率控制，端侧复用现有 DCQCN |
 | 19 | THEMIS | ESW 上的 PNP/TRP，端侧复用现有 DCQCN |
 
@@ -58,9 +53,6 @@ CrossDC-Algos/
 
 ```
 config/
-├── flows/
-│   ├── flow-background.txt
-│   └── flow.txt
 ├── topology/
 │   ├── topology.txt
 │   ├── topology-testbed.txt
@@ -76,16 +68,14 @@ config/
 
 所有配置文件中的路径已修改为相对路径格式：
 ```txt
-TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology.txt
-FLOW_FILE examples/CrossDC-Algos/config/flows/flow.txt
-QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow.txt
+TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-multiDC.txt
+QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
-BACKGROUND_FLOW_FILE examples/CrossDC-Algos/config/flows/flow-background.txt
 ```
 
 主程序中的默认路径也已同步修改。
 
-### 3. 运行仿真
+### 2. 运行仿真
 
 #### 运行单个算法
 
@@ -105,27 +95,37 @@ python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 12 Bifrost
 # 进入 ns-3.39 目录
 cd simulator/ns-3.39
 
-# 运行所有算法（DCQCN, HPCC, Timely, FRP, ROCC, Bifrost, GRC）
+# 按原来的 Bash 循环运行默认算法列表
 bash examples/CrossDC-Algos/scripts/run_all_algos.sh
 
 # 或者运行指定的算法
 bash examples/CrossDC-Algos/scripts/run_all_algos.sh "1:DCQCN" "13:FRP"
+
+# 使用场景专用配置；单算法脚本原有 --config 用法保持不变
+python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
+  --config examples/CrossDC-Algos/config/workload/config-motivation1.txt
 ```
 
-### 4. 查看结果
+### 3. 查看结果
 
 - **日志文件**：`results/dump/algo_cc{ccMode}_load{load}.log`
-- **数据文件**：`results/fct/`, `results/pfc/`, `results/txrate/`
+- **数据文件**：`results/fct/`, `results/pfc/`
 - **瓶颈队列文件**：默认位于 `results/bottleneck_queue_length/`，可通过已有的 `BOTTLENECK_MON_FILE` 配置指定。
 - **图片文件**：`plots/workload_{algo}_cc{ccMode}_load{load}.png`
+
+每次实验从空的结果目录开始，只使用一份配置。批量脚本沿用默认的 `config-workload.txt`；
+单算法脚本可通过原有的 `--config` 参数选择专用配置。
+输出沿用原来的命名和目录，不添加配置名后缀，不混用其他配置或旧结果。
+辅助监控文件的路径由所选配置中的配置项控制。
 
 ## 输出说明
 
 ### 主图（吞吐量 + 队列长度）
 
 包含两个子图：
+
 - **上图**：接收端吞吐量（RX Throughput）- 每个 query flow 的接收速率
-- **下图**：Top 5 拥塞点的队列长度 - 自动检测的平均队列长度最大的端口
+- **下图**：Top 3 拥塞点的队列长度 - 自动检测的平均队列长度最大的端口
 
 ### TX Rate 图
 
@@ -134,6 +134,7 @@ bash examples/CrossDC-Algos/scripts/run_all_algos.sh "1:DCQCN" "13:FRP"
 ### 统计数据
 
 脚本会输出：
+
 - 流数量统计（总流数、query 流数、背景流数）
 - 拥塞点检测（交换机、端口、平均/最大队列长度）
 - FCT 统计（平均、P99、最大/最小）
@@ -143,8 +144,8 @@ bash examples/CrossDC-Algos/scripts/run_all_algos.sh "1:DCQCN" "13:FRP"
 
 ✅ **完全独立**：不依赖 PowerTCP 目录，可独立运行  
 ✅ **结构清晰**：配置、结果、图片分离  
-✅ **易于扩展**：新增算法只需添加配置文件  
-✅ **路径统一**：所有路径基于 CrossDC-Algos 目录  
+✅ **易于扩展**：新增算法需实现代码并配置运行入口  
+✅ **路径统一**：配置中的相对路径以 ns-3.39 根目录为基准
 
 ## 注意事项
 
@@ -174,15 +175,13 @@ CrossDC-Algos/
 ├── cdf.c                       ✅ 依赖库
 ├── cdf.h                       ✅ 依赖库头文件
 ├── config/
-│   ├── flows/                  ✅ 流文件
 │   ├── topology/               ✅ 拓扑文件
 │   ├── query-flow/             ✅ query-flow 文件
 │   └── workload/               ✅ 配置文件
 ├── results/                    ✅ 仿真结果
 │   ├── dump/
 │   ├── fct/
-│   ├── pfc/
-│   └── txrate/
+│   └── pfc/
 ├── plots/                      ✅ 图片输出
 ├── scripts/
 │   ├── run_single_workload_algo.py  ✅ 单算法运行脚本
@@ -230,10 +229,10 @@ DC0 包含 H0–H3，DC1 包含 H4–H7，DC2 包含 H8–H11。
 
 ### 2. motivation1：一条跨域流与两条域内流
 
-配置：[config-workload.txt](config/workload/config-workload.txt)；
+配置：[config-motivation1.txt](config/workload/config-motivation1.txt)；
 拓扑：[topology-motivation.txt](config/topology/topology-motivation.txt)；
 查询流：[query-flow-motivation1.txt](config/query-flow/query-flow-motivation1.txt)。
-运行时通过已有脚本的 `--topology`、`--query-flow` 参数选择上述文件。
+通过原有 `--config` 参数选择专用配置，拓扑、查询流和部署节点一起切换。
 
 DC0 包含 H0–H3，DC1 包含 H4–H7；DCI 为 SW14、SW15，
 跨域链路为 100 Gbps、单向传播时延 5 ms，主机接入链路为 40 Gbps。
@@ -249,10 +248,10 @@ H0→H6 与 H5→H6 共享 H6 的接收链路；H4→H7 虽然目的主机不同
 
 ### 3. motivation2：两条跨域流与一条域内流
 
-配置：[config-workload.txt](config/workload/config-workload.txt)；
+配置：[config-motivation2.txt](config/workload/config-motivation2.txt)；
 拓扑：[topology-motivation.txt](config/topology/topology-motivation.txt)；
 查询流：[query-flow-motivation2.txt](config/query-flow/query-flow-motivation2.txt)。
-运行时同样通过 `--topology`、`--query-flow` 选择场景。
+同样通过 `--config` 选择专用配置。
 DC 划分、带宽及传播时延与 motivation1 相同。
 
 H0、H1 同时跨域发送到 H4，竞争 H4 的接收链路；H6→H5 是 DC1 内流。
@@ -288,11 +287,12 @@ SW6↔SW7 的单向传播时延为 5 ms，其余链路为 1.5 μs。
 ### 运行与结果口径
 
 四个场景的仿真上限均为 2 s，均开启查询流完成后自动停止。
-FCT 从各条流的实际开始时间计起，域内和跨域流分别统计；到停止时间仍未完成的流单独标记，
-不能只用已完成流计算均值来代表全部流。
+FCT 从各条流的实际开始时间计起，域内和跨域流分别统计。当前 FCT 文件只记录已完成流，
+分析时需单独记录未完成流，不能只用已完成流计算均值来代表全部流。
 
-DCI-Ext 和 ATC 需要显式指定部署节点。批量脚本按场景覆盖以下节点编号，
-同一场景的五种算法共用算法及端侧参数，并监控本场景的全部交换机：
+DCI-Ext 和 ATC 的部署节点由所选配置指定，motivation 专用配置已设置下表节点。
+仅覆盖拓扑和查询流不会自动修改部署节点，应优先使用完整场景配置。
+参数已恢复到扫参前的 `DCIEXT_OBSERVE_MB 20`、`DCIEXT_SND_TICK_US 400`：
 
 | 场景 | 发送侧 DCI | 接收侧 DCI |
 | --- | --- | --- |
