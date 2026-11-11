@@ -108,8 +108,6 @@ DCIEXT_T_US 400
 DCIEXT_DT_US 4
 # 固定 RTT 目标区间半宽；沿用原 ACK/RTT 三分支更新
 DCIEXT_SIGMA_US 3
-# DIP 带宽 B（Gbps）：可用带宽上界（clamp）与下界 B/64
-DCIEXT_DIP_BW_G 40
 # 新流观察期（整数 MB）；达到阈值后执行 CNP 初始化，再每 T 查表调速
 DCIEXT_OBSERVE_MB 1
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）

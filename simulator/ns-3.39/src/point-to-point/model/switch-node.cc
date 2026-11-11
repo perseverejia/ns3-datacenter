@@ -1191,17 +1191,17 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
 //   接收侧（senderSide=false）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 // ============================================================================
 void SwitchNode::InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                                   double dipBwGbps, uint64_t observeMb,
+                                   uint64_t dipBwBps, uint64_t observeMb,
                                    uint32_t agingPeriods, bool senderSide,
                                    double dtUs, double sigmaUs) {
     m_dciExtEnabled = true;
     m_dciExt.SetSenderSide(senderSide);
-    m_dciExt.Configure(nodeId, burstIntervalUs, periodTUs, dipBwGbps,
+    m_dciExt.Configure(nodeId, burstIntervalUs, periodTUs, dipBwBps,
                        observeMb, agingPeriods, dtUs, sigmaUs);
     std::cout << "[DCIEXT] Initialized DCI-Ext v3 on switch " << GetId()
               << (senderSide ? " (SENDER: 表A+观察期+ECN反馈+0xFA消费)"
                              : " (RECEIVER: RTT探测+周期0xFA反馈)")
-              << " (T=" << periodTUs << "us, dipBw=" << dipBwGbps << "G"
+              << " (T=" << periodTUs << "us, dipBw=" << dipBwBps / 1e9 << "G"
               << ", observe=" << observeMb << "MB"
               << ", aging=" << agingPeriods << "T"
               << ", Dt=" << dtUs << "us, sigma=" << sigmaUs << "us)" << std::endl;

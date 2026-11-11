@@ -107,7 +107,7 @@ public:
 
     // ---------- 初始化（宿主 SwitchNode::InitializeDciExt 调用） ----------
     void Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                   double dipBwGbps, uint64_t observeMb,
+                   uint64_t dipBwBps, uint64_t observeMb,
                    uint32_t agingPeriods, double dtUs, double sigmaUs);
     // 发送回调 -> SwitchNode::SendToDev（CNP / 0xFA 独立包发出）
     void SetSendCallback(Callback<void, Ptr<Packet>, CustomHeader&> cb);
@@ -145,7 +145,7 @@ private:
 
     Time m_burstInterval;         // 普通控制的 CNP 连发间隔，默认 4us
     Time m_periodT;               // 收发双方统一周期 T：接收方反馈、发送方压制
-    double m_dipBwBps;            // DIP 带宽 B，初值及速率上下限的参考
+    double m_dipBwBps;            // 拓扑中的服务器接入带宽 B，用于发送侧初值及探测上界
     uint64_t m_observeBytes;      // 新流观察期字节数，默认 1 MB = 1,000,000 B
     uint32_t m_agingPeriods;      // 流老化时长 = N 个周期 T
     double m_dtUs;                // 期望排队时延 Dt（RTT_t = RTT_base + Dt）

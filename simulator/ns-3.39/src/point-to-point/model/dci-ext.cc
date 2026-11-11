@@ -11,23 +11,27 @@
 
 namespace ns3 {
 
+namespace {
+constexpr uint64_t kDciExtMinRateBps = 1000000000ULL; // 停滞门限、探测下界及每流配额下界：1Gbps
+}
+
 DciExt::DciExt()
     : m_debug(true), m_nodeId(0), m_senderSide(false),
       m_burstInterval(MicroSeconds(4)),
       m_periodT(MicroSeconds(400)),
-      m_dipBwBps(40e9), m_observeBytes(1000000ULL),
+      m_dipBwBps(0), m_observeBytes(1000000ULL),
       m_agingPeriods(2), m_dtUs(4), m_sigmaUs(3) {
     BuildTable();
     m_periodEvent = EventId();
 }
 
 void DciExt::Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                       double dipBwGbps, uint64_t observeMb,
+                       uint64_t dipBwBps, uint64_t observeMb,
                        uint32_t agingPeriods, double dtUs, double sigmaUs) {
     m_nodeId = nodeId;
     m_burstInterval = MicroSeconds(burstIntervalUs);
     m_periodT = MicroSeconds(periodTUs);
-    m_dipBwBps = dipBwGbps * 1e9;
+    m_dipBwBps = dipBwBps; // B = 拓扑中的服务器接入带宽，收发两侧一致
     m_observeBytes = observeMb * 1000000ULL;
     m_agingPeriods = agingPeriods;
     m_dtUs = dtUs;
@@ -230,7 +234,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                     f.observeBytes = 0;
                     f.lastActive = Simulator::Now();
 
-                    // 表A 无此 DIP：初始可用带宽 = DIP 带宽 B >> 2（1/4，即 40G/4 = 10G）
+                    // 表A 无此 DIP：初始可用带宽 = 服务器接入带宽 B >> 2（1/4）
                     // 注：不用长链路线速（100G/4=25G）——R_avbl 语义是"该 DIP 可分得的带宽"，
                     // 上界由 B 约束；首反馈到达前用保守初值，避免首查表压制不足
                     auto dit = m_sndDips.find(ch.dip);
@@ -529,7 +533,7 @@ void DciExt::SndTick() {
 //      分配：每流份额 = R_avbl / ceilPow2(N)（N=2 → /2；N=3 → 取 4）；
 //      表二：每 SenderDC 份额 = 每流份额 × 该DC流数
 //      （例：R_avbl=25.6G，N=3（DC A 2 条 + DC B 1 条）→ A = 25.6/4×2 = 12.8G，B = 25.6/4 = 6.4G）
-//      （每流下限兜底 B/64，防 ACK 断流期反馈 0 配额死锁）
+//      （每流下限兜底 1Gbps，防 ACK 断流期反馈 0 配额）
 //   6. 0xFA 发往每组（目的 IP = 该组活跃流的 sip）
 // ---------------------------------------------------------------------------
 void DciExt::PeriodicTick() {
@@ -594,10 +598,10 @@ void DciExt::PeriodicTick() {
 
         DciExtRcvDip &rd = m_rcvDips[dip];
 
-        // 统计失真防护：ACK 返回速率过低（< B/10，断流/恢复瞬态）时本 T 的
+        // 统计失真防护：ACK 返回速率过低（< 1Gbps，断流/恢复瞬态）时本 T 的
         // ACK/RTT 统计不可信，R_avbl 与 RTT_base 全部保持不变。
         // （PFC 振荡是 DC 内拥塞管理常态，振荡期间 ACK 正常流动、统计可信，不冻结）
-        bool stalled = ackRateBps < m_dipBwBps / 10.0;
+        bool stalled = ackRateBps < kDciExtMinRateBps;
 
         // RTT_base = 运行最小值（首个样本初始化，之后只降不升）
         if (!stalled && a.rttCnt > 0 && a.rttMinUs < rd.rttBaseUs) {
@@ -635,7 +639,7 @@ void DciExt::PeriodicTick() {
                 }
             } else if (rttAvgUs > rttT + m_sigmaUs) {
                 // b. 排队超预期：R_avbl 只降不升——取 ACK 速率与当前值最小
-                //   （能走到此处 ackRate >= B/10，非 0；压低后由发送方压制兑住）
+                //   （能走到此处 ackRate >= 1Gbps，非 0；压低后由发送方压制兑住）
                 rd.rAvblBps = std::min(rd.rAvblBps, ackRateBps);
                 branch = "CONGESTED";
             } else {
@@ -656,8 +660,8 @@ void DciExt::PeriodicTick() {
                 double rNewBps = Wt / tSec * 8.0; // Wt 为字节 → ×8 转 bps（与 ackRateBps 口径一致）
                 if (rNewBps > m_dipBwBps)
                     rNewBps = m_dipBwBps;      // clamp 到 B
-                if (rNewBps < (m_dipBwBps / 64.0))
-                    rNewBps = m_dipBwBps / 64.0; // 兕底防塌缩
+                if (rNewBps < kDciExtMinRateBps)
+                    rNewBps = kDciExtMinRateBps; // 兜底防塌缩
                 rd.rAvblBps = std::max(rd.rAvblBps, rNewBps); // 只升不降
                 branch = "PROBE";
                 }
@@ -692,11 +696,9 @@ void DciExt::PeriodicTick() {
             shift++;
         }
         uint64_t perFlow = (uint64_t)rd.rAvblBps >> shift;
-        // 兜底下限：ACK 差分瞬态归零时不得反馈 0 配额（否则发送方 ratio=0
-        // → n=MAX 连发 → 永久死锁）。下限 dipBw/64（625Mbps）只作恢复期兜底
-        uint64_t minPerFlow = (uint64_t)m_dipBwBps >> 6;
-        if (perFlow < minPerFlow)
-            perFlow = minPerFlow;
+        // 每流配额至少为 1Gbps，为 ACK 断流/恢复阶段保留非零反馈配额。
+        if (perFlow < kDciExtMinRateBps)
+            perFlow = kDciExtMinRateBps;
 
         for (auto &sc : a.senderCounts) {
             // 5. 表二：每 SenderDC 分得 (R_avbl/ceilPow2(N)) × 该DC流数
