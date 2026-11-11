@@ -568,7 +568,7 @@ def run_and_plot(args):
                     sw = int(parts[2])
                     port = int(parts[3])
                     t_ms = float(parts[1]) / 1e9 * 1000
-                    q_kb = float(parts[4]) / 1024.0
+                    q_kb = float(parts[4]) / 1000.0
                     all_queue_data.setdefault((sw, port), {"times": [], "queues": []})
                     all_queue_data[(sw, port)]["times"].append(t_ms)
                     all_queue_data[(sw, port)]["queues"].append(q_kb)
@@ -579,7 +579,7 @@ def run_and_plot(args):
                     sw = int(parts[2])
                     port = int(parts[3])
                     t_ms = float(parts[1]) * 1000
-                    q_kb = float(parts[5])
+                    q_kb = float(parts[5]) * 1024.0 / 1000.0  # FRP 日志以 KiB 输出
                     all_queue_data.setdefault((sw, port), {"times": [], "queues": []})
                     all_queue_data[(sw, port)]["times"].append(t_ms)
                     all_queue_data[(sw, port)]["queues"].append(q_kb)
@@ -650,7 +650,7 @@ def run_and_plot(args):
         ax2.set_title(f"RX Throughput - query flows ({len(active_flows)} flows)", fontsize=15, fontweight="bold")
         ax2.legend(loc="upper right", fontsize=10, ncol=3, framealpha=0.9)
         ax2.grid(True, alpha=0.3, linestyle="--")
-        ax2.set_ylim(0, 110)
+        ax2.set_ylim(bottom=0)
         ax2.tick_params(labelsize=11)
 
         ax3 = axes[1]
@@ -661,15 +661,13 @@ def run_and_plot(args):
                 label = f"SW{cp['switch']} Port{cp['port']} (avg={cp['avg_q_kb']:.0f}KB)"
                 ax3.fill_between(cp["times"], 0, cp["queues"], alpha=0.20, color=color)
                 ax3.plot(cp["times"], cp["queues"], color=color, lw=1.5, label=label, alpha=0.85)
-            ax3.axhline(y=500, color="blue", ls="--", lw=2, alpha=0.5, label="qRef = 500KB (old)")
-            ax3.axhline(y=300, color="red", ls=":", lw=1.5, alpha=0.5, label="qRef = 300KB (current)")
         ax3.set_ylabel("Queue Length (KB)", fontsize=14, fontweight="bold")
         ax3.set_xlabel("Time (ms)", fontsize=14, fontweight="bold")
         ax3.set_title(f"Top {len(top_congestion)} Congestion Points Queue Length (auto-detected)", fontsize=15, fontweight="bold")
         ax3.legend(loc="upper right", fontsize=10, framealpha=0.9)
         ax3.grid(True, alpha=0.3, linestyle="--")
         max_q = max([cp["max_q_kb"] for cp in top_congestion], default=1000)
-        ax3.set_ylim(-50, max_q * 1.15)
+        ax3.set_ylim(0, max(max_q * 1.15, 1))
         ax3.tick_params(labelsize=11)
 
         plt.tight_layout()

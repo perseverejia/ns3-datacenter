@@ -180,7 +180,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                         e.ackedBytes += (uint64_t)(ackSeq - f.ackWatermark);
                         f.ackWatermark = ackSeq;
                         // RTT_cross 采样：确认最近被确认包的出长链->ACK到达差（含两个 5ms 长链）
-                        auto ub = f.dataArrival.upper_bound(ackSeq);
+                        auto ub = f.dataArrival.lower_bound(ackSeq); // ACK 只确认 seq < ackSeq
                         if (ub != f.dataArrival.begin()) {
                             --ub;
                             double rttUs = (double)(Simulator::Now() - ub->second).GetTimeStep() / 1000.0;
@@ -255,7 +255,15 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
     if (fromLongLink && ch.l3Prot == 0x11) {
         // 正向数据包从长链路到达：建流表（受管流集合 + SenderDC 分组依据）
         DciExtFlowKey key(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
-        DciExtRcvFlow &f = m_rcvFlows[key];
+        auto inserted = m_rcvFlows.try_emplace(key);
+        DciExtRcvFlow &f = inserted.first->second;
+        if (inserted.second) {
+            auto saved = m_rcvAckWatermarks.find(key);
+            if (saved != m_rcvAckWatermarks.end()) {
+                f.ackWatermark = saved->second;
+                m_rcvAckWatermarks.erase(saved);
+            }
+        }
         f.sip = ch.sip;
         f.dip = ch.dip;
         f.sport = ch.udp.sport;
@@ -313,8 +321,13 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         // ACK 包的 sport/dport 与数据流反转
         DciExtFlowKey key(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport);
         auto it = m_rcvFlows.find(key);
-        if (it == m_rcvFlows.end())
-            return false; // 非受管流（本地流等），原样放行
+        if (it == m_rcvFlows.end()) {
+            // 已老化流的迟到 ACK 仅推进保存的水位，不重新激活或补计历史字节。
+            auto saved = m_rcvAckWatermarks.find(key);
+            if (saved != m_rcvAckWatermarks.end() && ch.ack.seq > saved->second)
+                saved->second = ch.ack.seq;
+            return false; // 非活动受管流，原样放行
+        }
         DciExtRcvFlow &f = it->second;
         f.lastActive = Simulator::Now();
 
@@ -329,7 +342,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
             // seq < ackSeq 且未消费的项（最近被确认的数据包，含 m_ack_interval
             // 里程碑多包一 ACK 的情况），其出队->ACK到达差即纯 DC 内 RTT。
             // 重复 NACK 不越水位不采样，重传重打时间戳，天然幂等。
-            auto ub = f.dataArrival.upper_bound(ackSeq);
+            auto ub = f.dataArrival.lower_bound(ackSeq);
             if (ub != f.dataArrival.begin()) {
                 --ub; // 最后一个 seq < ackSeq 的项 = 本 ACK 新确认的包
                 double rttUs = (double)(Simulator::Now() - ub->second).GetTimeStep() / 1000.0;
@@ -337,7 +350,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                 f.rttSumUs += rttUs;
                 if (rttUs < f.rttMinUs) f.rttMinUs = rttUs;
                 if (rttUs > f.rttMaxUs) f.rttMaxUs = rttUs;
-                f.dataArrival.erase(f.dataArrival.begin(), std::next(ub)); // 清 ≤已确认项防泄漏
+                f.dataArrival.erase(f.dataArrival.begin(), std::next(ub)); // 仅清理 seq < ackSeq
             }
         }
     }
@@ -500,7 +513,7 @@ void DciExt::SndTick() {
 
 // ---------------------------------------------------------------------------
 // 接收方周期 T：RTT 驱动可用带宽探测 + 0xFA 反馈
-//   1. 流老化：lastActive 距今 > agingPeriods×T 的流移出
+//   1. 流老化：lastActive 距今 > agingPeriods×T 的流移出，保留累计 ACK 水位
 //   2. 聚合 per DIP：N、ackRate（winAckBytes×8/T）、txRate（winTxBytes×8/T，
 //      DCI→DC 出队口径）、纯DC内RTT样本（出队打点 -> ACK 回到差分）
 //   3. RTT 探测状态机（RTT_base = 运行最小值；RTT_t = RTT_base + Dt）：
@@ -522,12 +535,13 @@ void DciExt::SndTick() {
 void DciExt::PeriodicTick() {
     Time now = Simulator::Now();
 
-    // 1. 老化
+    // 1. 老化：移出活动流计数，累计确认水位保留到恢复或实例销毁。
     Time aging = m_agingPeriods * m_periodT;
     for (auto it = m_rcvFlows.begin(); it != m_rcvFlows.end();) {
-        if (now - it->second.lastActive > aging)
+        if (now - it->second.lastActive > aging) {
+            m_rcvAckWatermarks[it->first] = it->second.ackWatermark;
             it = m_rcvFlows.erase(it);
-        else
+        } else
             ++it;
     }
 

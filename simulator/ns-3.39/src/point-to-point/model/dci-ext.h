@@ -158,6 +158,9 @@ private:
     Callback<Ptr<NetDevice>, uint32_t> m_getDevCb;
 
     std::map<DciExtFlowKey, DciExtRcvFlow> m_rcvFlows;  // 接收方流表
+    // 老化流只保留累计 ACK 水位，不参与聚合；恢复时移回活动流表。
+    // 协议无流结束标识，水位随 DciExt 实例释放，避免长暂停后重复计数。
+    std::map<DciExtFlowKey, uint32_t> m_rcvAckWatermarks;
     std::map<DciExtFlowKey, DciExtSndFlow> m_sndFlows;  // 发送方流表
     std::map<uint32_t, DciExtSndDip> m_sndDips;         // 发送方 表A: dip -> 速度表项
     std::map<uint32_t, DciExtRcvDip> m_rcvDips;         // 接收方 per-DIP RTT探测状态
