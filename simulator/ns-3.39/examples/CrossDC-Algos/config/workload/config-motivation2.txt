@@ -95,7 +95,7 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 14）：表A DIP速度表 + 流观察期(20MiB→学费CNP→400us静默→查表)
+# 发送方 DCI（节点 14）：表A DIP速度表 + 流观察期(20MiB→CNP初始化→T周期查表)
 #                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 消费/查表连发
 # 接收方 DCI（节点 15）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
@@ -110,9 +110,8 @@ DCIEXT_DT_US 4
 DCIEXT_SIGMA_US 3
 # DIP 带宽 B（Gbps）：可用带宽上界（clamp）与下界 B/64
 DCIEXT_DIP_BW_G 40
-# 新流观察期（MiB，线速传输）：期满发学费 CNP 后按下方静默时长等待 alpha 衰减
+# 新流观察期（MiB）；达到阈值后执行 CNP 初始化，再每 T 查表调速
 DCIEXT_OBSERVE_MB 20
-DCIEXT_SILENT_US 400
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
 # motivation 发送侧 DCI：SW14，执行表A、观察期、ECN反馈及0xFA消费

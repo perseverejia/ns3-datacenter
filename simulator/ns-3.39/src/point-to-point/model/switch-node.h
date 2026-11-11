@@ -168,7 +168,7 @@ public:
 
 	// ========== DCI-Ext (ccMode=16) 接口 ==========
 	void InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-	                      double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
+	                      double dipBwGbps, uint64_t observeMb,
 	                      uint32_t agingPeriods, bool senderSide = false,
 	                      double dtUs = 6.0, double sigmaUs = 3.0);   // 初始化 DCI-Ext v3（发送方表A/观察期/ECN反馈，接收方RTT探测+周期0xFA）
 	Ptr<NetDevice> GetDevByIndex(uint32_t ifIndex);                            // 端口设备查询（DCI-Ext NotifyDequeue 判长链路用）

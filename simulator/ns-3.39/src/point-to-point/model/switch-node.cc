@@ -1185,24 +1185,24 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
 }
 
 // ============================================================================
-// DCI-Ext (ccMode=16) v3: DCI 交换机初始化（表驱动，无门控）
-//   发送侧（senderSide=true）：表A DIP速度表 + 流观察期(20MB→学费CNP→1ms静默→查表)
-//                               + ECN 快速反馈 + 0xFA 反馈消费/查表连发
+// DCI-Ext (ccMode=16): DCI 交换机初始化
+//   发送侧（senderSide=true）：DIP 预算 + 观察/CNP初始化/周期查表
+//                               + ECN 快速反馈 + 0xFA 反馈消费
 //   接收侧（senderSide=false）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 // ============================================================================
 void SwitchNode::InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                                   double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
+                                   double dipBwGbps, uint64_t observeMb,
                                    uint32_t agingPeriods, bool senderSide,
                                    double dtUs, double sigmaUs) {
     m_dciExtEnabled = true;
     m_dciExt.SetSenderSide(senderSide);
     m_dciExt.Configure(nodeId, burstIntervalUs, periodTUs, dipBwGbps,
-                       observeMb, silentUs, agingPeriods, dtUs, sigmaUs);
+                       observeMb, agingPeriods, dtUs, sigmaUs);
     std::cout << "[DCIEXT] Initialized DCI-Ext v3 on switch " << GetId()
               << (senderSide ? " (SENDER: 表A+观察期+ECN反馈+0xFA消费)"
                              : " (RECEIVER: RTT探测+周期0xFA反馈)")
               << " (T=" << periodTUs << "us, dipBw=" << dipBwGbps << "G"
-              << ", observe=" << observeMb << "MB, silent=" << silentUs << "us"
+              << ", observe=" << observeMb << "MB"
               << ", aging=" << agingPeriods << "T"
               << ", Dt=" << dtUs << "us, sigma=" << sigmaUs << "us)" << std::endl;
 }

@@ -1,34 +1,9 @@
 #ifndef DCI_EXT_H
 #define DCI_EXT_H
 
-// ============================================================================
-// DCI-Ext (ccMode=16) v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-//
-// 发送方 DCI（senderSide=true，如 SW14）：
-//   表 A DIP 速度表【DIP, R_avbl, R_snd】：R_avbl 由 0xFA 反馈更新，
-//       R_snd 在收到 0FA 时刻结算（对齐节拍）；R_snd > R_avbl → 查表连发 CNP
-//   流表（观察期状态机）：新流前 m_observeBytes(20MB) 线速 → 发 1 个 CNP
-//       → 静默 1ms（alpha 衰减到 ~1/256）→ R_snd vs R_avbl 查表首次压制 → CTL
-//   ECN 快速反馈：跨域流数据包携带 ECN → 清 ECN 位 + 立即反馈 CNP 给源
-//   （CNP 生成权垄断在发送方：清位使接收方 host 不再生成慢速 CNP-ACK）
-//
-// 接收方 DCI（senderSide=false，如 SW15）：
-//   流表：受管跨域流（从长链路入），记录长链路入端口（= SenderDC 标识）与
-//         ACK 差分累计（per-DIP ACK 反馈速率）
-//   表一【DIP, N(总流数), ACK反馈速率】：周期 T 从流表聚合（含老化）
-//   表二【DIP, SenderDC, 流数】：同一次聚合按入端口分组
-//   周期 T 反馈：N<3 用 DIP 的 ACK 反馈速率，N>=3 用 DIP 带宽 B(40G)；
-//     除法用移位（N 上取 2 的幂 P，份额 = base >> log2(P)）；
-//     每 SenderDC 分得 份额×该DC流数，编码为 0xFA 发往对端
-//
-// 0xFA 反馈报文：PPP + IPv4(0xFA) + qbbHeader（与 ACK 同格式）：
-//   sport/dport = DIP 高/低 16 位，seq = R_avbl（Kbps 单位），q0 最高优先级
-//
-// 查表连发（与 v2 相同）：LookupN(r) = 最小 n 使 M[n] <= r，
-//   每流都降到同一比例 r → 聚合发送速率按比例收敛到 R_avbl
-//
-// 隔离性: 所有逻辑仅在本类内部, 由 SwitchNode::m_dciExtEnabled 控制（ccMode=16 才为 true）
-// ============================================================================
+// DCIExt: OBSERVE -> CNP 初始化(alpha≈0.2) -> 每 T 查表控制。
+// 仅启动阶段按已发 CNP 建模 alpha；普通控制沿用构造时预计算的固定表。
+// 接收侧沿用原 RTT/ACK 三分支，无新增 RTT 或 ACK 平滑。
 
 #include <map>
 #include <tuple>
@@ -79,25 +54,32 @@ struct DciExtRcvDip {
     DciExtRcvDip() : rAvblBps(0), hasRAvbl(false), rttBaseUs(1e18), hasRttBase(false), lastCongested(false) {}
 };
 
+// 仅用于启动 CNP 序列的原生 alpha 时钟；不参与普通控制查表。
+struct DciExtInitCnpState {
+    bool initialized = false;
+    bool pending = false;
+    double alpha = 0;
+    int64_t nextAlphaNs = 0;
+};
+
 // 发送方流表项：观察期状态机
 struct DciExtSndFlow {
     uint32_t sip, dip;
     uint16_t sport, dport;
     uint8_t pg;
-    enum State { OBSERVE = 0, SILENT = 1, CTL = 2 };
-    State state;             // OBSERVE=20MB线速观察; SILENT=1ms静默; CTL=受查表控制
+    enum State { OBSERVE = 0, INIT_CNP = 1, CTL = 2 };
+    State state;             // 观察 -> CNP初始化 -> T周期控制
     uint64_t observeBytes;   // 观察期累计发送字节（payload 口径）
-    Time silentUntil;        // 静默期满时刻（SILENT 态）
     uint32_t burstRemaining; // 本轮待连发 CNP 个数
     EventId burstEvent;
     Time lastActive;
-    bool pendingSilent;      // 学费 5 连发中：burst 结束后才转入 SILENT（静默起点 = burst 结束）
+    DciExtInitCnpState cnp;       // 仅用于启动 CNP 初始化
     uint32_t ackWatermark;   // ACK 累计确认水位（回程差分扣减 Inflight 用）
     std::map<uint32_t, Time> dataArrival; // seq -> 出长链路时刻（RTT_cross 采样匹配）
 
     DciExtSndFlow() : sip(0), dip(0), sport(0), dport(0), pg(0),
-                      state(OBSERVE), observeBytes(0), silentUntil(Seconds(0)),
-                      burstRemaining(0), lastActive(Seconds(0)), pendingSilent(false),
+                      state(OBSERVE), observeBytes(0),
+                      burstRemaining(0), lastActive(Seconds(0)),
                       ackWatermark(0) {
         burstEvent = EventId();
     }
@@ -105,9 +87,9 @@ struct DciExtSndFlow {
 
 // 发送方 表A：DIP 速度表【DIP, R_avbl, R_snd, Inflight, RTT_cross】
 struct DciExtSndDip {
-    double rAvblBps;      // 可用带宽 P（0xFA 更新；初始 = 长链路带宽 >> 2）
+    double rAvblBps;      // 可用带宽 P（0xFA 更新；初始 = DIP 带宽 B/4）
     uint64_t sndBytes;    // 出长链路字节累计（payload 口径，R_snd 结算源）
-    double sndRateBps;    // R_snd：上次结算的发送速率（0xFA 到达时刻结算）
+    double sndRateBps;    // R_snd：最近一次实际测量窗口的发送速率
     Time lastSettle;      // 上次结算时刻
     uint64_t dataSentBytes; // 已出长链路数据字节累计（Inflight = dataSent - acked）
     uint64_t ackedBytes;    // 回程 ACK 已确认字节累计（水位差分）
@@ -125,7 +107,7 @@ public:
 
     // ---------- 初始化（宿主 SwitchNode::InitializeDciExt 调用） ----------
     void Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                   double dipBwGbps, uint64_t observeMb, uint32_t silentUs,
+                   double dipBwGbps, uint64_t observeMb,
                    uint32_t agingPeriods, double dtUs, double sigmaUs);
     // 发送回调 -> SwitchNode::SendToDev（CNP / 0xFA 独立包发出）
     void SetSendCallback(Callback<void, Ptr<Packet>, CustomHeader&> cb);
@@ -142,27 +124,29 @@ public:
     void NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
 
     // ---------- 内部 ----------
-    bool IsLongLinkPort(Ptr<NetDevice> dev) const;  // channel delay > 100us
+    bool IsLongLinkPort(Ptr<NetDevice> dev) const;  // topology 显式声明的 WAN 端口
     void PeriodicTick();                            // 接收方周期 T：聚合表一/二 + 发 0xFA
-    void SndTick();                                 // 发送方周期 T：首调时刻起，每 T 维持 R_snd ≤ R_avbl
+    void SndTick();                                 // 发送方周期 T：初始化完成后，每 T 结算并控制
     void SendCnpForFlow(const DciExtFlowKey &key);  // 构造并发出 1 个 CNP
     void SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps); // 0xFA 反馈
+    void InitCnpTick(DciExtFlowKey key);          // CNP序列初始化alpha，完成后无额外等待
     void BurstTick(DciExtFlowKey key);              // 连发定时器回调
     uint32_t LookupN(double ratio) const;           // 查表: 目标压制比例 -> 连发个数 n
-    double ComputeV(DciExtSndDip &e, double tSec);  // BDP 管道填充: v = (P×(T+RTT_cross) - Inflight)/T
+    double ComputeV(DciExtSndDip &e, double tSec);  // 原配额调整：首个跨域 RTT 前为 P，之后为 0.9P
 
     bool m_debug;                 // 日志开关
     uint32_t m_nodeId;            // 宿主节点 ID（日志用）
     bool m_senderSide;            // 发送方 DCI（表A/观察期/ECN反馈），否则接收方（表一/二）
 
 private:
-    void BuildTable();            // 预计算 M[n] 压制乘子表
+    void BuildTable();            // 构造时一次初始化固定乘子表
+    static void AdvanceAlpha(DciExtInitCnpState &state, int64_t nowNs);
+    static void RecordCnp(DciExtInitCnpState &state, int64_t nowNs);
 
     Time m_burstInterval;         // CNP 连发间隔（对应 1us alpha 更新窗口）
     Time m_periodT;               // 收发双方统一周期 T：接收方反馈、发送方压制
-    double m_dipBwBps;            // DIP 带宽 B（N>=3 时的分配基准）
+    double m_dipBwBps;            // DIP 带宽 B，初值及速率上下限的参考
     uint64_t m_observeBytes;      // 新流观察期字节数（20MB 线速）
-    Time m_silentUs;              // 观察期满学费 CNP 后的静默时长（1ms，alpha 衰减）
     uint32_t m_agingPeriods;      // 流老化时长 = N 个周期 T
     double m_dtUs;                // 期望排队时延 Dt（RTT_t = RTT_base + Dt）
     double m_sigmaUs;             // RTT 目标区间容差 sigma

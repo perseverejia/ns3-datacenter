@@ -119,7 +119,6 @@ uint32_t dciext_burst_interval_us = 1;  // CNP 连发间隔（对应 1us alpha �
 double dciext_t_us = 400;              // 收发双方统一周期 T（us）
 double dciext_dip_bw_g = 40;           // DIP 带宽 B（Gbps，N>=3 时的分配基准）
 uint64_t dciext_observe_mb = 20;       // 新流观察期（MB，线速传输）
-uint32_t dciext_silent_us = 1000;      // 观察期满学费 CNP 后静默时长（alpha 衰减到 ~1/256）
 uint32_t dciext_aging_periods = 2;     // 流老化时长 = N 个周期 T
 double dciext_dt_us = 6.0;              // 期望跨域流排队时延 Dt（us，RTT_t = RTT_base + Dt）
 double dciext_sigma_us = 3.0;           // RTT 目标区间容差 sigma（us）
@@ -1165,11 +1164,6 @@ int main(int argc, char *argv[])
 			conf >> v;
 			dciext_observe_mb = v;
 			std::cout << "DCIEXT_OBSERVE_MB\t\t" << v << "\n";
-		} else if (key.compare("DCIEXT_SILENT_US") == 0) {
-			uint32_t v;
-			conf >> v;
-			dciext_silent_us = v;
-			std::cout << "DCIEXT_SILENT_US\t\t" << v << "\n";
 		} else if (key.compare("DCIEXT_AGING_PERIODS") == 0) {
 			uint32_t v;
 			conf >> v;
@@ -1804,7 +1798,7 @@ int main(int argc, char *argv[])
 				if (dciext_sender_tax_nodes.count(i) > 0) {
 					sw->InitializeDciExt(i, dciext_burst_interval_us,
 					                       dciext_t_us, dciext_dip_bw_g,
-					                       dciext_observe_mb, dciext_silent_us,
+					                       dciext_observe_mb,
 					                       dciext_aging_periods, /*senderSide=*/true,
 						                       dciext_dt_us, dciext_sigma_us);
 				}
@@ -1814,7 +1808,7 @@ int main(int argc, char *argv[])
 					// 接收方 DCI：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 					sw->InitializeDciExt(i, dciext_burst_interval_us,
 					                       dciext_t_us, dciext_dip_bw_g,
-					                       dciext_observe_mb, dciext_silent_us,
+					                       dciext_observe_mb,
 					                       dciext_aging_periods, /*senderSide=*/false,
 						                       dciext_dt_us, dciext_sigma_us);
 					// 接收方 DCI 禁 ECN 标记：拥塞信号唯一通道 = 0xFA 反馈 + 发送方 DCI 快速 CNP；
