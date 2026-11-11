@@ -121,7 +121,7 @@ public:
 	} frp;
 
 	struct {
-		uint64_t lastSeq;
+		uint64_t sentBytes;
 		Time lastTime;
 		EventId m_eventId;
 	} txRate;

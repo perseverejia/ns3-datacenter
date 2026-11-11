@@ -83,7 +83,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	frp.m_lastBottleneckUpdate = Time(0);
 	frp.m_timerExpired = false;
 
-	txRate.lastSeq = 0;
+	txRate.sentBytes = 0;
 	txRate.lastTime = Time(0);
 }
 

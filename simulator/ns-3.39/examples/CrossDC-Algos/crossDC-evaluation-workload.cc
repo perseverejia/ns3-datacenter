@@ -1812,7 +1812,7 @@ int main(int argc, char *argv[])
 					// （走 5ms 长链路回传），绕过发送方"CNP 生成权垄断 + ECN 清位"机制
 					sw->SetAttribute("EcnEnabled", BooleanValue(false));
 
-					// 深缓冲 DCI 网关：每端口每队列 headroom = 20MB（50MB 实验证实过深：
+					// 深缓冲 DCI 网关：每端口每队列 headroom = 20MiB（50MB 实验证实过深：
 					// PFC 长期锁闭 + ACK 差分尖峰毒化反馈环，流 8 FCT 反而劣化 70ms）
 					// 作用：SW19 PFC 反压 SW22 时，SW22 吸住 WAN 持续灌入不丢包，
 					// 反压链 SW14→SW19→SW22 完整传递，SW19 ingress 不再被 RESUME 倾泻冲爆
@@ -1828,7 +1828,7 @@ int main(int argc, char *argv[])
 						// bufferPool 同步扩容（否则 50MB 积压会先撞上 buffer_size+旧total 硬上限而丢包）
 						sw->m_mmu->SetBufferPool(buffer_size * 1024 * 1024 + newTotal);
 						std::cout << "[DCIEXT] Deep buffer on switch " << i
-						          << ": headroom=50MB/queue, xoffTotal=" << newTotal / (1024 * 1024) << "MB" << std::endl;
+						          << ": headroom=20MiB/queue, xoffTotal=" << newTotal / (1024 * 1024) << "MiB" << std::endl;
 					}
 
 					// 仅禁用长链路（WAN）端口的 PFC：防止长链路反压阻断 ACK/0xFA 出口；

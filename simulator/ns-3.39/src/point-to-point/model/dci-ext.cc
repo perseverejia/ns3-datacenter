@@ -136,8 +136,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                        e.rAvblBps / 1e9, e.sndRateBps / 1e9, (unsigned long)(e.sndBytes));
             }
 
-            // BDP 管道填充控制：v = (P×(T+RTT_cross) − Inflight)/T，ratio = v/R_snd
-            //   替代原 R_avbl/R_snd——把“速率配额”改为“管道水位缺口折算的本周期应发速率”
+            // 当前配额控制：首个跨域 RTT 前用 P，之后用 0.9P。
             if (e.rAvblBps > 0 && e.sndRateBps > 0) {
                 double vBps = ComputeV(e, m_periodT.GetSeconds());
                 // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
@@ -483,7 +482,7 @@ void DciExt::SndTick() {
         e.lastSettle = now;
 
         if (e.rAvblBps > 0 && e.sndRateBps > 0) {
-            // BDP 管道填充控制（与 0xFA OVERLOAD 同式）：v vs R_snd 驱动查表连发
+            // 与 0xFA OVERLOAD 同式：调整后的配额与 R_snd 驱动固定表查找。
             double vBps = ComputeV(e, m_periodT.GetSeconds());
             // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
             double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);

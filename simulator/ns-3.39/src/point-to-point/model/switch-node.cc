@@ -417,10 +417,9 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 	// 如果列表为空，则监控所有交换机
 	// qlen_mon_switches 在文件开头已声明（全局命名空间）
 	if (::qlen_mon_switches.empty() || ::qlen_mon_switches.count(m_id) > 0) {
-		static uint64_t s_qlenLastTs[64][8] = {{0}};
 		uint64_t nowTs = Simulator::Now().GetTimeStep();
-		if (ifIndex < 64 && qIndex < 8 && nowTs - s_qlenLastTs[ifIndex][qIndex] > 100000) {
-			s_qlenLastTs[ifIndex][qIndex] = nowTs;
+		if (ifIndex < 64 && qIndex < 8 && nowTs - m_qlenLastTs[ifIndex][qIndex] > 100000) {
+			m_qlenLastTs[ifIndex][qIndex] = nowTs;
 			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
 			if (dev) {
 				uint32_t qBytes = dev->GetQueue()->GetNBytesTotal();

@@ -337,7 +337,7 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 	// Notify Nic
 	m_nic[nic_idx].dev->NewQp(qp);
 	if (m_txRateSampleInterval > 0) {
-		qp->txRate.lastSeq = qp->snd_nxt;
+		// NewQp may already have sent a packet; keep the constructor's counter.
 		qp->txRate.lastTime = Simulator::Now();
 		qp->txRate.m_eventId = Simulator::Schedule(MicroSeconds(m_txRateSampleInterval),
 		                                            &RdmaHw::SampleTxRate, this, qp);
@@ -777,6 +777,8 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp) {
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp) {
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	if (m_txRateSampleInterval > 0 && Simulator::Now() > qp->txRate.lastTime)
+		SampleTxRate(qp); // Flush the final partial sampling interval.
 	if (UsesDcqcn()) { // 复用 DCQCN
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -877,6 +879,8 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
 }
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap) {
+	if (m_txRateSampleInterval > 0)
+		qp->txRate.sentBytes += qp->lastPayloadSize;
 	qp->lastPktSize = pkt->GetSize();
 //	SeqTsHeader seqTs;
 //	pkt->PeekHeader(seqTs);
@@ -900,13 +904,12 @@ void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t
 }
 
 void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
-	if (qp == NULL || qp->IsFinished() || m_txRateSampleInterval <= 0) {
+	if (qp == NULL || m_txRateSampleInterval <= 0) {
 		return;
 	}
 
 	Time now = Simulator::Now();
-	uint64_t curSeq = qp->snd_nxt;
-	uint64_t sentBytes = curSeq >= qp->txRate.lastSeq ? curSeq - qp->txRate.lastSeq : 0;
+	uint64_t sentBytes = qp->txRate.sentBytes;
 	double dtSec = (now - qp->txRate.lastTime).GetSeconds();
 	double rateBps = dtSec > 0 ? static_cast<double>(sentBytes) * 8.0 / dtSec : 0.0;
 
@@ -921,10 +924,11 @@ void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
 	        rateBps, (double)qp->mlx.m_targetRate.GetBitRate(), (unsigned long long)now.GetNanoSeconds());
 	#endif
 
-	qp->txRate.lastSeq = curSeq;
+	qp->txRate.sentBytes = 0;
 	qp->txRate.lastTime = now;
-	qp->txRate.m_eventId = Simulator::Schedule(MicroSeconds(m_txRateSampleInterval),
-	                                            &RdmaHw::SampleTxRate, this, qp);
+	if (!qp->IsFinished())
+		qp->txRate.m_eventId = Simulator::Schedule(MicroSeconds(m_txRateSampleInterval),
+		                                            &RdmaHw::SampleTxRate, this, qp);
 }
 void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate) {
 #if 1
@@ -996,17 +1000,7 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q) {
 				clamp = false;
 		}
 		if (clamp) {
-			// ccMode=16：Rt 下限 = 1/4 链路带宽——CLAMP=1 把 Rt 锁到砍穿后的低速率，
-			// 会让 FastRecovery 5 档全部向地板逼近（域内流 ~300ms 慢爬）；
-			// 下限保证砍穿后 3~4 档（~4ms）即可回到 1/4 带宽平台
-			if (m_cc_mode == 16) {
-				uint32_t nic_idx = GetNicIdxOfQp(q);
-				Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
-				DataRate floorRt(dev->GetDataRate().GetBitRate() / 4);
-				q->mlx.m_targetRate = std::max(q->m_rate, floorRt);
-			} else {
-				q->mlx.m_targetRate = q->m_rate;
-			}
+			q->mlx.m_targetRate = q->m_rate;
 		}
 		// ePFC (ccMode=17)：CCF 设速窗口内 CNP 降速下限钳制在 rv——
 		// CCF 每 90μs 才设速一次（周期机制），CNP 持续到达持续降速，降多设少会净向下漂移；

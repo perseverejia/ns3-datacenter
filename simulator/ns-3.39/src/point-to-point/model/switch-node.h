@@ -102,6 +102,7 @@ protected:
 	std::map<uint32_t, uint32_t> m_prevQBytes;
 
 private:
+	uint64_t m_qlenLastTs[64][8] = {};
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
 	Ptr<QbbNetDevice> GetOutDevice(Ptr<Packet> p, CustomHeader &ch);
 	void SendToDev(Ptr<Packet>p, CustomHeader &ch);

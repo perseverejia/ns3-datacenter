@@ -218,7 +218,7 @@ CrossDC-Algos/
 
 ATC 和 DCI-Ext 的发送侧固定为 SW21/SW23，接收侧固定为 SW22，
 没有查询流的源 DC 保持空闲，无需切换部署节点。
-DCI-Ext 的新流观察期为 `DCIEXT_OBSERVE_MB 1`，收发双方共用周期 `DCIEXT_T_US 400`。
+DCI-Ext 的新流观察期为 `DCIEXT_OBSERVE_MB 10`，收发双方共用周期 `DCIEXT_T_US 400`。
 DCI-Ext 的带宽基准 B 自动取拓扑中的服务器接入带宽（假设所有接入链路速率一致），
 发送侧新 DIP 的初始配额为 B/4，接收侧 PROBE 候选速率上界为 B。
 接收侧 DIP 总 ACK 速率低于 1 Gbps 时保持估计不变；PROBE 候选速率下界和
