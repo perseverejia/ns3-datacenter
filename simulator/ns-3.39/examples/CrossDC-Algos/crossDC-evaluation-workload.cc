@@ -115,12 +115,12 @@ uint32_t pfc_ingress_pool_mb = 0;
 double pfc_ingress_alpha = 1.0 / 8;
 
 // DCI-Ext (ccMode=16) 参数（X_OFF 派生自 PFC_INGRESS_POOL_MB × PFC_INGRESS_ALPHA）
-uint32_t dciext_burst_interval_us = 1;  // CNP 连发间隔（对应 1us alpha 更新窗口）
+uint32_t dciext_burst_interval_us = 4;  // 普通控制的 CNP 连发间隔，默认 4us
 double dciext_t_us = 400;              // 收发双方统一周期 T（us）
 double dciext_dip_bw_g = 40;           // DIP 带宽 B（Gbps，N>=3 时的分配基准）
-uint64_t dciext_observe_mb = 20;       // 新流观察期（MB，线速传输）
+uint64_t dciext_observe_mb = 1;         // 新流观察期，十进制 MB（1 MB = 1,000,000 B）
 uint32_t dciext_aging_periods = 2;     // 流老化时长 = N 个周期 T
-double dciext_dt_us = 6.0;              // 期望跨域流排队时延 Dt（us，RTT_t = RTT_base + Dt）
+double dciext_dt_us = 4.0;              // 期望跨域流排队时延 Dt（us，RTT_t = RTT_base + Dt）
 double dciext_sigma_us = 3.0;           // RTT 目标区间容差 sigma（us）
 std::set<uint32_t> dciext_sender_tax_nodes; // 发送方 DCI 交换机列表（表A+观察期+ECN反馈+0xFA消费）
 

@@ -13,10 +13,10 @@ namespace ns3 {
 
 DciExt::DciExt()
     : m_debug(true), m_nodeId(0), m_senderSide(false),
-      m_burstInterval(MicroSeconds(1)),
+      m_burstInterval(MicroSeconds(4)),
       m_periodT(MicroSeconds(400)),
-      m_dipBwBps(40e9), m_observeBytes(20ULL << 20),
-      m_agingPeriods(2) {
+      m_dipBwBps(40e9), m_observeBytes(1000000ULL),
+      m_agingPeriods(2), m_dtUs(4), m_sigmaUs(3) {
     BuildTable();
     m_periodEvent = EventId();
 }
@@ -28,7 +28,7 @@ void DciExt::Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodT
     m_burstInterval = MicroSeconds(burstIntervalUs);
     m_periodT = MicroSeconds(periodTUs);
     m_dipBwBps = dipBwGbps * 1e9;
-    m_observeBytes = observeMb << 20;
+    m_observeBytes = observeMb * 1000000ULL;
     m_agingPeriods = agingPeriods;
     m_dtUs = dtUs;
     m_sigmaUs = sigmaUs;

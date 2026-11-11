@@ -95,23 +95,23 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(20MiB→CNP初始化→T周期查表)
-#                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 消费/查表连发
+# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(1MB→CNP初始化→T周期查表)
+#                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 配额消费
 # 接收方 DCI（节点 22）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
 # ================================================================================
-# CNP 连发间隔（对应 1us alpha 更新窗口）
+# 原方案的 CNP 连发间隔
 DCIEXT_BURST_INTERVAL_US 4
 # 收发双方统一周期 T（us）：接收方聚合反馈/RTT 探测，发送方周期压制
 DCIEXT_T_US 400
-# 期望跨域流排队时延 Dt（us）：RTT_t = RTT_base + Dt
+# 固定 RTT 目标：RTT_base + Dt
 DCIEXT_DT_US 4
-# RTT 目标区间容差 sigma（us）：[RTT_t-sigma, RTT_t+sigma] 内直接用 ACK 速率
+# 固定 RTT 目标区间半宽；沿用原 ACK/RTT 三分支更新
 DCIEXT_SIGMA_US 3
 # DIP 带宽 B（Gbps）：可用带宽上界（clamp）与下界 B/64
 DCIEXT_DIP_BW_G 40
-# 新流观察期（MiB）；达到阈值后执行 CNP 初始化，再每 T 查表调速
-DCIEXT_OBSERVE_MB 20
+# 新流观察期（整数 MB）；达到阈值后执行 CNP 初始化，再每 T 查表调速
+DCIEXT_OBSERVE_MB 1
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
 # 发送方 DCI 交换机列表（multiDC 中继拓扑：SW21、SW23 = 两条长链路发送端，表A+观察期+ECN反馈+0xFA消费）

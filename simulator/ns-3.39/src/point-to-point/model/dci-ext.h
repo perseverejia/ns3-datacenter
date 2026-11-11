@@ -143,10 +143,10 @@ private:
     static void AdvanceAlpha(DciExtInitCnpState &state, int64_t nowNs);
     static void RecordCnp(DciExtInitCnpState &state, int64_t nowNs);
 
-    Time m_burstInterval;         // CNP 连发间隔（对应 1us alpha 更新窗口）
+    Time m_burstInterval;         // 普通控制的 CNP 连发间隔，默认 4us
     Time m_periodT;               // 收发双方统一周期 T：接收方反馈、发送方压制
     double m_dipBwBps;            // DIP 带宽 B，初值及速率上下限的参考
-    uint64_t m_observeBytes;      // 新流观察期字节数（20MB 线速）
+    uint64_t m_observeBytes;      // 新流观察期字节数，默认 1 MB = 1,000,000 B
     uint32_t m_agingPeriods;      // 流老化时长 = N 个周期 T
     double m_dtUs;                // 期望排队时延 Dt（RTT_t = RTT_base + Dt）
     double m_sigmaUs;             // RTT 目标区间容差 sigma
