@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 crossDC workload algorithm runner script.
-Workload parameters live in simulator/ns-3.39/examples/CrossDC-Algos/config/workload/config-workload.txt.
+Workload parameters live in simulator/ns-3.39/examples/CrossDC-Algos/config/workload/config-micro.txt.
 Specify only the algorithm here, for example:
     python3 run_single_workload_algo.py 13 FRP
 """
@@ -94,7 +94,7 @@ def analyze_query_flow_fct(query_fct_file):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CROSSDC_ALGOS_DIR = os.path.dirname(SCRIPT_DIR)  # examples/CrossDC-Algos
 NS3_DIR = os.path.dirname(os.path.dirname(CROSSDC_ALGOS_DIR))  # ns-3.39
-CONFIG_FILE = "examples/CrossDC-Algos/config/workload/config-workload.txt"
+CONFIG_FILE = "examples/CrossDC-Algos/config/workload/config-micro.txt"
 DUMP_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results/dump")
 RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
@@ -934,7 +934,7 @@ Examples:
     parser.add_argument("--timeout", type=int, default=180,
                         help="Timeout in seconds (default: 180 = 3 minutes)")
     parser.add_argument("--config", type=str, default=None,
-                        help="Config file path relative to ns-3.39 (default: config-workload.txt)")
+                        help="Config file path relative to ns-3.39 (default: config-micro.txt)")
     parser.add_argument("--topology", type=str, default=None,
                         help="Override TOPOLOGY_FILE in config (relative to ns-3.39)")
     parser.add_argument("--query-flow", type=str, default=None,

@@ -1,5 +1,5 @@
 # ================================================================================
-# CrossDC-Algos 40G testbed 配置（算法/缓冲参数同步自 workload）
+# CrossDC-Algos micro 公共配置（multiDC / motivation1 / motivation2 / testbed）
 # 按算法分组配置，便于管理和对比实验
 # ================================================================================
 
@@ -9,12 +9,12 @@ PACKET_PAYLOAD_SIZE 1000
 SIMULATOR_STOP_TIME 2.0
 ERROR_RATE_PER_LINK 0.0000
 ENABLE_TRACE 1
-NIC_DELAY 15000
+NIC_DELAY 0
 
 # ===== 拓扑和流量文件 =====
-# 修改这里即可切换拓扑和查询流文件（无需改代码）
-TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-testbed.txt
-QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-testbed.txt
+# 四个场景共用 micro 拓扑，仅通过运行脚本的 --query-flow 切换查询流
+TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-micro.txt
+QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
 
@@ -27,7 +27,7 @@ QUERY_FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/query-flow-{suffix}
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
 LOAD 0
 LOAD_DC1 0
-START_TIME 0.005
+START_TIME 0
 FLOW_LAUNCH_END_TIME 0.1
 QUERY_REQUEST_RATE 0
 REQUEST_SIZE 0
@@ -60,7 +60,7 @@ MIN_RATE 100Mb/s
 # [Bifrost] ccMode=12 - Bifrost 周期性 PFC 机制
 # 仅在 DCI 交换机上启用，其他交换机回退到 DCQCN
 # ================================================================================
-BIFROST_DEPLOY_SWITCH 7
+BIFROST_DEPLOY_SWITCH 22
 BIFROST_PFC_PERIOD 100
 
 # ================================================================================
@@ -79,9 +79,9 @@ BIFROST_PFC_PERIOD 100
 # 基于 DCQCN 端侧调速，在 DCI 交换机启用 gateway
 # ================================================================================
 GATEWAY_TYPE 0
-# 发送侧 DCI 网关（testbed：SW6；接收侧为 SW7）
-GATEWAY_SRC 1 6
-GATEWAY_DST 1 7
+# micro 发送侧 DCI 为 SW21/SW23，接收侧为 SW22；无流量的源 DC 保持空闲
+GATEWAY_SRC 2 21 23
+GATEWAY_DST 1 22
 MAX_ATC_VOQ_COUNT 128
 MAX_ATC_VOQ_RATE 100000000000
 ATC_VOQ_MAX_SIZE 1000000
@@ -95,12 +95,12 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 6）：表A DIP速度表 + 流观察期(1MB→CNP初始化→T周期查表)
+# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(1MB→CNP初始化→T周期查表)
 #                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 配额消费
-# 接收方 DCI（节点 7）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
+# 接收方 DCI（节点 22）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
 # ================================================================================
-# CNP 连发间隔（us）
+# 原方案的 CNP 连发间隔
 DCIEXT_BURST_INTERVAL_US 4
 # 收发双方统一周期 T（us）：接收方聚合反馈/RTT 探测，发送方周期压制
 DCIEXT_T_US 400
@@ -114,14 +114,14 @@ DCIEXT_DIP_BW_G 40
 DCIEXT_OBSERVE_MB 1
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
-# testbed 发送方 DCI 交换机（表A、观察期、ECN反馈和带宽反馈消费）
-DCIEXT_SENDER_TAX_NODES 1 6
+# micro 发送方 DCI 交换机列表（四个场景共用 SW21、SW23）
+DCIEXT_SENDER_TAX_NODES 2 21 23
 
 # ================================================================================
 # [ePFC] ccMode=17 - extended PFC：PFC 的流级扩展（所有交换机打标 + 边缘执行）
 # 打标：入口超 PFC 动态门限×百分比 且 出口超阈值；或接收方 DCI 出口超阈值
 # 边缘：CCF 出端口对端是 host 或接收方 DCI；超额判据用内部 RTT
-# 接收方 DCI 列表：个数 + 节点 ID（testbed 为 SW7）
+# 接收方 DCI 列表：个数 + 节点 ID（micro 为 SW22）
 # ================================================================================
 EPFC_INGRESS_MUL_PCT 50
 EPFC_EGRESS_THRESH_KB 256
@@ -129,8 +129,8 @@ EPFC_DCI_TH_KB 256
 EPFC_RTT_INTERNAL_US 30
 EPFC_AGING_RTTS 2
 EPFC_UPDATE_T_US 1000
-EPFC_RX_DCI_NODES 1 7
-# 固定 rv 测试（Gbps，0=正常采样驱动）：>0 时 SW7 表 rv 钉死该值，
+EPFC_RX_DCI_NODES 1 22
+# 固定 rv 测试（Gbps，0=正常采样驱动）：>0 时 SW22 表 rv 钉死该值，
 # 窗内 MIN 棘轮旁路，CCF 双向改写为该值——隔离 rv 塌缩变量，单检门控执行层
 EPFC_FIXED_RV_G 20
 
@@ -214,5 +214,6 @@ ENABLE_QLEN_MON 1
 QLEN_MON_START 0
 QLEN_MON_END 2000000000
 # 指定监控队列长度的交换机 ID 列表（空格分隔）
-# testbed 交换机：SW4、SW5、SW6、SW7
-QLEN_MON_SWITCHES 4 5 6 7
+# 如果不指定或为空，则监控所有交换机
+# 监控目的 DC 的两台 ToR、汇聚交换机和接收侧 DCI，覆盖四个场景的接收路径
+QLEN_MON_SWITCHES 14 15 19 22

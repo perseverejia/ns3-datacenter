@@ -869,7 +869,7 @@ int main(int argc, char *argv[])
 	double FLOW_LAUNCH_END_TIME = 0.045;
 	double load = 0.2;
 	unsigned randomSeed = 7;
-	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow.txt";
+	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt";
 	std::string queryFlowFctFile = "";  // Will be set via command line
 
 	uint32_t algorithm = 3;
@@ -877,7 +877,7 @@ int main(int argc, char *argv[])
 	std::map<std::string, std::string> themisParameters;
 	uint32_t windowCheck = 1;
 	uint32_t gatewayTypeOverride = UINT32_MAX;
-	std::string confFile = "examples/CrossDC-Algos/config/workload/config-testbed.txt";
+	std::string confFile = "examples/CrossDC-Algos/config/workload/config-micro.txt";
 	std::string cdfFileName = "examples/CrossDC-Algos/config/workload/Alistorage.txt";
 	// 命令行覆盖项：优先于配置文件中的 TOPOLOGY_FILE / QUERY_FLOW_FILE
 	std::string topologyFileOverride = "";
@@ -921,7 +921,9 @@ int main(int argc, char *argv[])
 		// 防御：解析失败（如注释中裸键名被误匹配后读到非法值）时告警并停止，
 		// 避免 failbit 状态下 while(!eof) 永真导致死循环
 		if (conf.fail()) {
-			std::cout << "WARNING: config parse error near token '" << key << "', stop parsing rest of " << confFile << std::endl;
+			if (!conf.eof()) {
+				std::cout << "WARNING: config parse error near token '" << key << "', stop parsing rest of " << confFile << std::endl;
+			}
 			break;
 		}
 		if (key.compare("ENABLE_QCN") == 0)
@@ -1454,7 +1456,7 @@ int main(int argc, char *argv[])
 		std::cout << "GATEWAY_TYPE_OVERRIDE	" << gatewayFlag << "\n";
 	}
 
-	// Python selects the CC algorithm for each run; workload parameters stay in config-workload.txt.
+	// Python selects the CC algorithm for each run; workload parameters stay in config-micro.txt.
 	cc_mode = algorithm; // overrides configuration file
 	has_win = windowCheck; // overrides configuration file
 	var_win = windowCheck; // overrides configuration file
@@ -1466,7 +1468,7 @@ int main(int argc, char *argv[])
 	}
 	
 
-	// workload parameters are owned by config-workload.txt.
+	// workload parameters are owned by config-micro.txt.
 	//simulator_stop_time = END_TIME;
 
 

@@ -9,22 +9,25 @@ CrossDC-Algos/
 ├── config/
 │   ├── topology/           # 拓扑文件
 │   │   ├── topology.txt
-│   │   ├── topology-testbed.txt
+│   │   ├── topology-micro.txt # 四个 micro 场景共用
 │   │   └── ...
 │   ├── query-flow/         # query-flow 文件
-│   │   ├── query-flow.txt
-│   │   └── ...
+│   │   ├── query-flow-multiDC.txt
+│   │   ├── query-flow-motivation1.txt
+│   │   ├── query-flow-motivation2.txt
+│   │   └── query-flow-testbed.txt
 │   └── workload/           # 配置文件
-│       ├── config-workload.txt
-│       ├── config-testbed.txt
-│       └── ...
+│       ├── config-micro.txt
+│       ├── Alistorage.txt
+│       └── websearch.txt
 ├── results/                # 仿真结果（运行时生成）
 │   ├── dump/               # 日志文件
 │   ├── fct/                # FCT 数据
 │   └── pfc/                # PFC 数据
 ├── plots/                  # 画图结果（运行时生成）
 ├── scripts/                # 运行脚本
-│   └── run_single_workload_algo.py
+│   ├── run_single_workload_algo.py
+│   └── run_all_algos.sh
 └── README.md               # 本文件
 ```
 
@@ -47,33 +50,35 @@ CrossDC-Algos/
 
 ## 使用方法
 
-### 1. 配置文件（已完成）
+### 1. 公共配置
 
-配置文件已复制到对应子目录，路径已修改为相对路径：
+multiDC、motivation1、motivation2 和 testbed 共用一份拓扑和一份配置，
+仅查询流文件不同：
 
 ```
 config/
 ├── topology/
-│   ├── topology.txt
-│   ├── topology-testbed.txt
-│   └── topology-256.txt
+│   └── topology-micro.txt
 ├── query-flow/
-│   ├── query-flow.txt
-│   ├── query-flow-testbed.txt
-│   └── query-flow-websearch.txt
+│   ├── query-flow-multiDC.txt
+│   ├── query-flow-motivation1.txt
+│   ├── query-flow-motivation2.txt
+│   └── query-flow-testbed.txt
 └── workload/
-    ├── config-workload.txt  (路径已修改)
-    └── Alistorage.txt
+    ├── config-micro.txt
+    ├── Alistorage.txt
+    └── websearch.txt
 ```
 
 所有配置文件中的路径已修改为相对路径格式：
+
 ```txt
-TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-multiDC.txt
+TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-micro.txt
 QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
 ```
 
-主程序中的默认路径也已同步修改。
+主程序和运行脚本都默认使用 `config-micro.txt`，默认查询流为 multiDC。
 
 ### 2. 运行仿真
 
@@ -101,10 +106,12 @@ bash examples/CrossDC-Algos/scripts/run_all_algos.sh
 # 或者运行指定的算法
 bash examples/CrossDC-Algos/scripts/run_all_algos.sh "1:DCQCN" "13:FRP"
 
-# 使用场景专用配置；单算法脚本原有 --config 用法保持不变
+# 单算法切换场景只需指定查询流
 python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
-  --config examples/CrossDC-Algos/config/workload/config-motivation1.txt
+  --query-flow examples/CrossDC-Algos/config/query-flow/query-flow-motivation1.txt
 ```
+
+批量脚本使用公共配置中的 `QUERY_FLOW_FILE` 选择场景。
 
 ### 3. 查看结果
 
@@ -113,10 +120,9 @@ python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
 - **瓶颈队列文件**：默认位于 `results/bottleneck_queue_length/`，可通过已有的 `BOTTLENECK_MON_FILE` 配置指定。
 - **图片文件**：`plots/workload_{algo}_cc{ccMode}_load{load}.png`
 
-每次实验从空的结果目录开始，只使用一份配置。批量脚本沿用默认的 `config-workload.txt`；
-单算法脚本可通过原有的 `--config` 参数选择专用配置。
-输出沿用原来的命名和目录，不添加配置名后缀，不混用其他配置或旧结果。
-辅助监控文件的路径由所选配置中的配置项控制。
+四个场景都使用 `config-micro.txt`。输出沿用原来的命名和目录，
+同算法、同负载切换查询流后会覆盖同名结果；比较场景前先保存上一场景的结果。
+辅助监控文件的路径由公共配置中的配置项控制。
 
 ## 输出说明
 
@@ -193,9 +199,25 @@ CrossDC-Algos/
 
 当前比较 DCQCN（模式 1）、DCI-Ext（模式 16）、GRC（模式 18）、ATC（模式 15）
 和 THEMIS（模式 19），四个场景如下。
-同一场景使用相同的拓扑、查询流、端侧参数和随机种子（`--randomSeed=7`）。
+所有场景共用 [topology-micro.txt](config/topology/topology-micro.txt) 和
+[config-micro.txt](config/workload/config-micro.txt)，随机种子默认为 `--randomSeed=7`。
 当前背景负载为 0，以下列出的查询流就是实际运行的全部流；每条流均为
 300,000,000 B（300 MB，约 286.10 MiB），优先级组 `pg=3`。
+
+### 公共 micro 拓扑和部署
+
+| DC | 主机 | ToR | 汇聚交换机 | DCI |
+| --- | --- | --- | --- | --- |
+| DC0 | H0–H3 | SW12、SW13 | SW18 | SW21 |
+| DC1 | H4–H7 | SW14、SW15 | SW19 | SW22 |
+| DC2 | H8–H11 | SW16、SW17 | SW20 | SW23 |
+
+每台 ToR 连接两台主机。主机接入链路均为 40 Gbps，交换机间链路均为 100 Gbps。
+跨域链路为 SW21↔SW22 和 SW22↔SW23，单向传播时延均为 5 ms；其余链路为 1.5 μs。
+
+ATC 和 DCI-Ext 的发送侧固定为 SW21/SW23，接收侧固定为 SW22，
+没有查询流的源 DC 保持空闲，无需切换部署节点。
+DCI-Ext 的新流观察期为 `DCIEXT_OBSERVE_MB 1`，收发双方共用周期 `DCIEXT_T_US 400`。
 
 查询流文件首行是流数量，后续各行格式为：
 
@@ -205,20 +227,15 @@ src dst pg dport flowSize(B) startTime(s)
 
 文件最后一列是相对启动偏移，实际仿真开始时间由
 `实际开始时间 = 配置中的 START_TIME + 文件中的 startTime` 计算。
-下表同时列出文件偏移和实际开始时间，单位为 ms；流大小单位为 B。
+公共配置的 `START_TIME=0`，因此文件偏移就是实际开始时间。
+下表时间单位为 ms，流大小单位为 B。
 DC 编号采用程序推导的编号，从 DC0 开始。
 
 ### 1. multiDC：两个源 DC 与目的 DC 内流共同发送到同一主机
 
-配置：[config-workload.txt](config/workload/config-workload.txt)；
-拓扑：[topology-multiDC.txt](config/topology/topology-multiDC.txt)；
 查询流：[query-flow-multiDC.txt](config/query-flow/query-flow-multiDC.txt)。
 
-DC0 包含 H0–H3，DC1 包含 H4–H7，DC2 包含 H8–H11。
-三个 DCI 分别为 SW21、SW22、SW23，跨域链路为 SW21↔SW22 和 SW22↔SW23，
-均为 100 Gbps、单向传播时延 5 ms。主机接入链路为 40 Gbps。
 两条跨域流分别从 DC0、DC2 发往 DC1，与 DC1 内的两条流共同竞争 H4 的接收带宽。
-配置的 `START_TIME=0`，两条跨域流在 0 ms 启动，两条域内流在 5.01 ms 启动。
 
 | 流 | 源主机（所属 DC） | 目的主机（所属 DC） | 类型 | 大小（B） | 文件偏移（ms） | 实际开始（ms） |
 | --- | --- | --- | --- | ---: | ---: | ---: |
@@ -229,15 +246,9 @@ DC0 包含 H0–H3，DC1 包含 H4–H7，DC2 包含 H8–H11。
 
 ### 2. motivation1：一条跨域流与两条域内流
 
-配置：[config-motivation1.txt](config/workload/config-motivation1.txt)；
-拓扑：[topology-motivation.txt](config/topology/topology-motivation.txt)；
 查询流：[query-flow-motivation1.txt](config/query-flow/query-flow-motivation1.txt)。
-通过原有 `--config` 参数选择专用配置，拓扑、查询流和部署节点一起切换。
 
-DC0 包含 H0–H3，DC1 包含 H4–H7；DCI 为 SW14、SW15，
-跨域链路为 100 Gbps、单向传播时延 5 ms，主机接入链路为 40 Gbps。
-H0→H6、H5→H6 与 H4→H6 均发往 H6，共享 SW11→H6 的 40 Gbps 接收链路。
-配置的 `START_TIME=0`，跨域流在 0 ms 启动，两条域内流在 5.01 ms 启动。
+H0→H6、H5→H6 与 H4→H6 均发往 H6，共享 SW15→H6 的 40 Gbps 接收链路。
 
 | 流 | 源主机（所属 DC） | 目的主机（所属 DC） | 类型 | 大小（B） | 文件偏移（ms） | 实际开始（ms） |
 | --- | --- | --- | --- | ---: | ---: | ---: |
@@ -247,14 +258,9 @@ H0→H6、H5→H6 与 H4→H6 均发往 H6，共享 SW11→H6 的 40 Gbps 接收
 
 ### 3. motivation2：两条跨域流与一条域内流
 
-配置：[config-motivation2.txt](config/workload/config-motivation2.txt)；
-拓扑：[topology-motivation.txt](config/topology/topology-motivation.txt)；
 查询流：[query-flow-motivation2.txt](config/query-flow/query-flow-motivation2.txt)。
-同样通过 `--config` 选择专用配置。
-DC 划分、带宽及传播时延与 motivation1 相同。
 
-H0→H4、H1→H4 与 H6→H4 均发往 H4，共享 SW10→H4 的 40 Gbps 接收链路。
-配置的 `START_TIME=0`，两条跨域流在 0 ms 启动，域内流在 5.01 ms 启动。
+H0→H4、H1→H4 与 H6→H4 均发往 H4，共享 SW14→H4 的 40 Gbps 接收链路。
 
 | 流 | 源主机（所属 DC） | 目的主机（所属 DC） | 类型 | 大小（B） | 文件偏移（ms） | 实际开始（ms） |
 | --- | --- | --- | --- | ---: | ---: | ---: |
@@ -264,37 +270,18 @@ H0→H4、H1→H4 与 H6→H4 均发往 H4，共享 SW10→H4 的 40 Gbps 接收
 
 ### 4. testbed：跨域流先启动，域内流随后竞争同一接收端
 
-配置：[config-testbed.txt](config/workload/config-testbed.txt)；
-拓扑：[topology-testbed.txt](config/topology/topology-testbed.txt)；
 查询流：[query-flow-testbed.txt](config/query-flow/query-flow-testbed.txt)。
 
-DC0 包含 H0、H1，DC1 包含 H2、H3；DCI 为 SW6、SW7。
-服务器接入链路 H0/H1↔SW4、H2/H3↔SW5 均为 **40 Gbps**；
-SW4↔SW6、SW5↔SW7 及 SW6↔SW7 均为 **100 Gbps**。
-SW6↔SW7 的单向传播时延为 5 ms，其余链路为 1.5 μs。
-两条流都发往 H2，共享 SW5→H2 的 40 Gbps 接收链路。
-
-配置的 `START_TIME=0.005 s`。因此文件中的 `0.000 s`、`0.005010 s`
-分别对应仿真时间 **5 ms、10.01 ms**。
+两条流共享 SW14→H4 的 40 Gbps 接收链路，DC2 空闲。
+跨域流从 0 ms 开始，域内流从 5.01 ms 开始。
 
 | 流 | 源主机（所属 DC） | 目的主机（所属 DC） | 类型 | 大小（B） | 文件偏移（ms） | 实际开始（ms） |
 | --- | --- | --- | --- | ---: | ---: | ---: |
-| 1 | H0（DC0） | H2（DC1） | 跨域 | 300000000 | 0 | 5 |
-| 2 | H3（DC1） | H2（DC1） | 域内 | 300000000 | 5.01 | 10.01 |
+| 1 | H0（DC0） | H4（DC1） | 跨域 | 300000000 | 0 | 0 |
+| 2 | H5（DC1） | H4（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 
 ### 运行与结果口径
 
 四个场景的仿真上限均为 2 s，均开启查询流完成后自动停止。
 FCT 从各条流的实际开始时间计起，域内和跨域流分别统计。当前 FCT 文件只记录已完成流，
 分析时需单独记录未完成流，不能只用已完成流计算均值来代表全部流。
-
-DCI-Ext 和 ATC 的部署节点由所选配置指定，motivation 专用配置已设置下表节点。
-仅覆盖拓扑和查询流不会自动修改部署节点，应优先使用完整场景配置。
-新流观察期为 `DCIEXT_OBSERVE_MB 1`，收发双方共用周期 `DCIEXT_T_US 400`：
-
-| 场景 | 发送侧 DCI | 接收侧 DCI |
-| --- | --- | --- |
-| multiDC | SW21、SW23 | SW22 |
-| motivation1 | SW14 | SW15 |
-| motivation2 | SW14 | SW15 |
-| testbed | SW6 | SW7 |
