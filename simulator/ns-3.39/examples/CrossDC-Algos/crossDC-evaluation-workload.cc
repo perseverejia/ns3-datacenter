@@ -868,7 +868,7 @@ int main(int argc, char *argv[])
 	double FLOW_LAUNCH_END_TIME = 0.045;
 	double load = 0.2;
 	unsigned randomSeed = 7;
-	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt";
+	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow-2-2.txt";
 	std::string queryFlowFctFile = "";  // Will be set via command line
 
 	uint32_t algorithm = 3;

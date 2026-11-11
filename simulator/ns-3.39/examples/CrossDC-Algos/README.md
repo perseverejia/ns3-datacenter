@@ -12,10 +12,10 @@ CrossDC-Algos/
 │   │   ├── topology-micro.txt # 四个 micro 场景共用
 │   │   └── ...
 │   ├── query-flow/         # query-flow 文件
-│   │   ├── query-flow-multiDC.txt
-│   │   ├── query-flow-motivation1.txt
-│   │   ├── query-flow-motivation2.txt
-│   │   └── query-flow-testbed.txt
+│   │   ├── query-flow-2-2.txt
+│   │   ├── query-flow-2-1.txt
+│   │   ├── query-flow-1-2.txt
+│   │   └── query-flow-1-1.txt
 │   └── workload/           # 配置文件
 │       ├── config-micro.txt
 │       ├── Alistorage.txt
@@ -52,18 +52,19 @@ CrossDC-Algos/
 
 ### 1. 公共配置
 
-multiDC、motivation1、motivation2 和 testbed 共用一份拓扑和一份配置，
-仅查询流文件不同：
+四个查询流场景共用一份拓扑和一份配置，仅查询流文件不同。
+查询流文件统一按 `query-flow-{短距流条数}-{长距流条数}.txt` 命名，
+其中短距流指域内流，长距流指跨 DC 流：
 
 ```
 config/
 ├── topology/
 │   └── topology-micro.txt
 ├── query-flow/
-│   ├── query-flow-multiDC.txt
-│   ├── query-flow-motivation1.txt
-│   ├── query-flow-motivation2.txt
-│   └── query-flow-testbed.txt
+│   ├── query-flow-2-2.txt
+│   ├── query-flow-2-1.txt
+│   ├── query-flow-1-2.txt
+│   └── query-flow-1-1.txt
 └── workload/
     ├── config-micro.txt
     ├── Alistorage.txt
@@ -74,11 +75,11 @@ config/
 
 ```txt
 TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-micro.txt
-QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt
+QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-2-2.txt
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
 ```
 
-主程序和运行脚本都默认使用 `config-micro.txt`，默认查询流为 multiDC。
+主程序和运行脚本都默认使用 `config-micro.txt`，默认查询流为 `query-flow-2-2.txt`。
 
 ### 2. 运行仿真
 
@@ -108,7 +109,7 @@ bash examples/CrossDC-Algos/scripts/run_all_algos.sh "1:DCQCN" "13:FRP"
 
 # 单算法切换场景只需指定查询流
 python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
-  --query-flow examples/CrossDC-Algos/config/query-flow/query-flow-motivation1.txt
+  --query-flow examples/CrossDC-Algos/config/query-flow/query-flow-2-1.txt
 ```
 
 批量脚本使用公共配置中的 `QUERY_FLOW_FILE` 选择场景。
@@ -235,9 +236,9 @@ src dst pg dport flowSize(B) startTime(s)
 下表时间单位为 ms，流大小单位为 B。
 DC 编号采用程序推导的编号，从 DC0 开始。
 
-### 1. multiDC：两个源 DC 与目的 DC 内流共同发送到同一主机
+### 1. 2 条短距流 + 2 条长距流
 
-查询流：[query-flow-multiDC.txt](config/query-flow/query-flow-multiDC.txt)。
+查询流：[query-flow-2-2.txt](config/query-flow/query-flow-2-2.txt)。
 
 两条跨域流分别从 DC0、DC2 发往 DC1，与 DC1 内的两条流共同竞争 H4 的接收带宽。
 
@@ -248,9 +249,9 @@ DC 编号采用程序推导的编号，从 DC0 开始。
 | 3 | H6（DC1） | H4（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 | 4 | H7（DC1） | H4（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 
-### 2. motivation1：一条跨域流与两条域内流
+### 2. 2 条短距流 + 1 条长距流
 
-查询流：[query-flow-motivation1.txt](config/query-flow/query-flow-motivation1.txt)。
+查询流：[query-flow-2-1.txt](config/query-flow/query-flow-2-1.txt)。
 
 H0→H6、H5→H6 与 H4→H6 均发往 H6，共享 SW15→H6 的 40 Gbps 接收链路。
 
@@ -260,9 +261,9 @@ H0→H6、H5→H6 与 H4→H6 均发往 H6，共享 SW15→H6 的 40 Gbps 接收
 | 2 | H5（DC1） | H6（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 | 3 | H4（DC1） | H6（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 
-### 3. motivation2：两条跨域流与一条域内流
+### 3. 1 条短距流 + 2 条长距流
 
-查询流：[query-flow-motivation2.txt](config/query-flow/query-flow-motivation2.txt)。
+查询流：[query-flow-1-2.txt](config/query-flow/query-flow-1-2.txt)。
 
 H0→H4、H1→H4 与 H6→H4 均发往 H4，共享 SW14→H4 的 40 Gbps 接收链路。
 
@@ -272,9 +273,9 @@ H0→H4、H1→H4 与 H6→H4 均发往 H4，共享 SW14→H4 的 40 Gbps 接收
 | 2 | H1（DC0） | H4（DC1） | 跨域 | 300000000 | 0 | 0 |
 | 3 | H6（DC1） | H4（DC1） | 域内 | 300000000 | 5.01 | 5.01 |
 
-### 4. testbed：跨域流先启动，域内流随后竞争同一接收端
+### 4. 1 条短距流 + 1 条长距流
 
-查询流：[query-flow-testbed.txt](config/query-flow/query-flow-testbed.txt)。
+查询流：[query-flow-1-1.txt](config/query-flow/query-flow-1-1.txt)。
 
 两条流共享 SW14→H4 的 40 Gbps 接收链路，DC2 空闲。
 跨域流从 0 ms 开始，域内流从 5.01 ms 开始。

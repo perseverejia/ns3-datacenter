@@ -1,5 +1,5 @@
 # ================================================================================
-# CrossDC-Algos micro 公共配置（multiDC / motivation1 / motivation2 / testbed）
+# CrossDC-Algos micro 公共配置（短距流-长距流：2-2 / 2-1 / 1-2 / 1-1）
 # 按算法分组配置，便于管理和对比实验
 # ================================================================================
 
@@ -14,7 +14,7 @@ NIC_DELAY 0
 # ===== 拓扑和流量文件 =====
 # 四个场景共用 micro 拓扑，仅通过运行脚本的 --query-flow 切换查询流
 TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-micro.txt
-QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-multiDC.txt
+QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-2-2.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
 
