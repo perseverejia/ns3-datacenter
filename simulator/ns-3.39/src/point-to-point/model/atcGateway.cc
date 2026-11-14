@@ -8,6 +8,7 @@
 #include "point-to-point-net-device.h"
 #include "ns3/custom-priority-tag.h"
 #include "ns3/interface-tag.h"
+#include "ns3/node.h"
 #include <assert.h>
 #include <sys/time.h>
 
@@ -301,9 +302,7 @@ void atcGateway::TransmitFromVoq(uint32_t voqId) {
         voq.diagPacketsSent++;
         voq.diagBytesSent += pktSize;
 
-        if (longHaulState.longHaulSrcIps.find(ch.sip) != longHaulState.longHaulSrcIps.end()) {
-            longHaulState.remoteForwardedBytes += pktSize;
-        }
+        RecordRemoteForwarded(pkt);
         
         // 转发数据包
         DoSwitchSendToDev(pkt, ch);
@@ -609,31 +608,16 @@ bool atcGateway::HandleDataPacketWithVoq(Ptr<NetDevice> device, Ptr<Packet> pkt,
 
 
 
-        Ptr<QbbNetDevice> qbbDevice = DynamicCast<QbbNetDevice>(device);
-        Ptr<QbbChannel> qbbChannel;
-        if (qbbDevice) {
-            qbbChannel = DynamicCast<QbbChannel>(qbbDevice->GetChannel());
-        }
-
-        if (qbbChannel && qbbChannel->GetDelay().GetTimeStep() > 100000) // 远端的报文
-        {
-        if (!longHaulState.longHaulChFlag) {
-            longHaulState.longHaulCh = ch;
-            longHaulState.longHaulChFlag = true;
-            StartLongHaulFeedbackTimer();
-        }
-        longHaulState.longHaulIngressIfIndex = qbbDevice->GetIfIndex();
-
-        // 记录远端源IP地址
-        if (longHaulState.longHaulSrcIps.find(ch.sip) == longHaulState.longHaulSrcIps.end()) {
-            longHaulState.longHaulSrcIps.insert(ch.sip);
-        }
+    Ptr<QbbNetDevice> qbbDevice = DynamicCast<QbbNetDevice>(device);
+    if (qbbDevice && qbbDevice->IsWanPort()) {
+        RegisterLongHaulPeer(qbbDevice->GetIfIndex(), qbbDevice->GetNode()->GetId(), ch);
     }
     
     // 使用VOQ调度
     int32_t voqId = AllocateVoq(destIp);
     if (voqId < 0) {
         // 没有可用VOQ，直接转发清理后的数据包
+        RecordRemoteForwarded(cleanPkt);
         DoSwitchSendToDev(cleanPkt, ch);
         return true; // 拦截原始数据包
     }
@@ -735,8 +719,11 @@ bool atcGateway::HandleLongHaulFeedback(Ptr<NetDevice> device, Ptr<Packet> pkt, 
     }
 
     if (m_debug & 0x2)
-         printf("+++atcGateway recv LongHaulFeedback localSentBytes:%lu remoteForwardedBytes:%lu  inflightBytes:%lu activeVoqCount:%d  time:%f\n",
-            longHaulState.localSentBytes,remoteForwardedBytes,longHaulState.localSentBytes - remoteForwardedBytes,activeVoqCount,Simulator::Now().GetSeconds());
+         printf("+++atcGateway recv LongHaulFeedback localSentBytes:%lu remoteForwardedBytes:%lu  inflightBytes:%lu activeVoqCount:%d  time:%f node:%u sourceIf:%u counterMismatch:%u\n",
+            longHaulState.localSentBytes,remoteForwardedBytes,
+            longHaulState.localSentBytes >= remoteForwardedBytes ? longHaulState.localSentBytes - remoteForwardedBytes : 0,
+            activeVoqCount,Simulator::Now().GetSeconds(),device->GetNode()->GetId(),device->GetIfIndex(),
+            remoteForwardedBytes > longHaulState.localSentBytes ? 1u : 0u);
 
     if (longHaulState.localSentBytes > remoteForwardedBytes) {
         uint64_t inflightBytes = longHaulState.localSentBytes - remoteForwardedBytes;
@@ -800,22 +787,6 @@ bool atcGateway::HandleLongHaulFeedback(Ptr<NetDevice> device, Ptr<Packet> pkt, 
              printf("+++atcGateway LongHaulFeedback resume sendRate rateLimit:%lu time:%f\n",longHaulState.rateLimit,Simulator::Now().GetSeconds());
     }
 
-    if (longHaulState.firstFeedback) {
-        longHaulState.firstFeedback = false;
-        longHaulState.lastFeedbackTime = Simulator::Now();
-    }
-    else
-    {
-        // 定期重置发送统计
-        if (Simulator::Now() - longHaulState.lastFeedbackTime > Seconds(1.0)) {
-            longHaulState.localSentBytes = 0;
-            longHaulState.lastLocalSentBytes = 0;
-            longHaulState.remoteForwardedBytes = 0;
-            longHaulState.inflightBytes = 0;
-            longHaulState.lastFeedbackTime = Simulator::Now();
-        }
-    }
-
     return true; 
 }
 
@@ -830,15 +801,46 @@ void atcGateway::InitLongHaulState(uint64_t longHaulBandwidth,Time longHaulDelay
     longHaulState.maxVoqBytes = 0;
     longHaulState.maxTotalVoqBytes = 0;
     longHaulState.activeVoqCount = 0;
-    longHaulState.longHaulChFlag = false;
-    longHaulState.longHaulIngressIfIndex = 0;
-    longHaulState.firstFeedback = true;
-    longHaulState.lastFeedbackTime = Simulator::Now();
+    if (longHaulFeedbackEvent.IsRunning()) {
+        Simulator::Cancel(longHaulFeedbackEvent);
+    }
+    longHaulFeedbackPeers.clear();
     longHaulState.maxInflightBytes = (M * (longHaulState.longHaulBandwidth * longHaulState.longHaulDelay.GetSeconds()) + 
                         longHaulState.longHaulBandwidth * LONGHAUL_FEEDBACK_PERIOD.GetSeconds())/8;
     longHaulState.rateLimit = longHaulState.longHaulBandwidth; // 初始速率400Gbps
     if (m_debug & 0x2)
         printf("+++atcGateway longHaulState maxInflightBytes:%lu , rateLimit:%f Gbps, time:%f\n",longHaulState.maxInflightBytes,longHaulState.rateLimit*1e-9,Simulator::Now().GetSeconds());
+}
+
+void atcGateway::RegisterLongHaulPeer(uint32_t ingressIfIndex, uint32_t nodeId,
+                                     const CustomHeader& ch) {
+    auto inserted = longHaulFeedbackPeers.emplace(ingressIfIndex, LongHaulFeedbackPeer());
+    if (!inserted.second) {
+        return;
+    }
+    inserted.first->second.routeHeader = ch;
+    inserted.first->second.nodeId = nodeId;
+    if (m_debug & 0x2) {
+        printf("+++atcGateway longHaulPeer node:%u peerIf:%u peerSip:%u time:%f\n",
+               nodeId, ingressIfIndex, ch.sip, Simulator::Now().GetSeconds());
+    }
+    if (longHaulFeedbackPeers.size() == 1) {
+        StartLongHaulFeedbackTimer();
+    }
+}
+
+void atcGateway::RecordRemoteForwarded(Ptr<const Packet> packet) {
+    // QbbNetDevice attaches the local ingress before PacketIn. Packet::Copy
+    // preserves this tag while different WANs share the same destination VOQ.
+    InterfaceTag ingress;
+    if (!packet->PeekPacketTag(ingress)) {
+        return;
+    }
+    auto peer = longHaulFeedbackPeers.find(ingress.GetPortId());
+    if (peer != longHaulFeedbackPeers.end()) {
+        peer->second.remoteForwardedBytes += packet->GetSize();
+        longHaulState.remoteForwardedBytes += packet->GetSize();
+    }
 }
 
 
@@ -850,19 +852,21 @@ void atcGateway::StartLongHaulFeedbackTimer() {
 
 // 生成长距离反馈
 void atcGateway::GenerateLongHaulFeedback() {
-    if (longHaulState.longHaulChFlag) {
+    for (const auto& entry : longHaulFeedbackPeers) {
+        const uint32_t ingressIfIndex = entry.first;
+        const LongHaulFeedbackPeer& peer = entry.second;
         // 用TCP头封装LongHaulFeedback
         TcpHeader seqh;
         seqh.SetDestinationPort(longHaulState.activeVoqCount);
-        seqh.SetSequenceNumber(SequenceNumber32((uint32_t)(longHaulState.remoteForwardedBytes & 0xFFFFFFFF)));
-        seqh.SetAckNumber(SequenceNumber32((uint32_t)((longHaulState.remoteForwardedBytes >> 32) & 0xFFFFFFFF)));
+        seqh.SetSequenceNumber(SequenceNumber32((uint32_t)(peer.remoteForwardedBytes & 0xFFFFFFFF)));
+        seqh.SetAckNumber(SequenceNumber32((uint32_t)((peer.remoteForwardedBytes >> 32) & 0xFFFFFFFF)));
 
         Ptr<Packet> newp = Create<Packet>(std::max(60 - 14 - 20 - (int)seqh.GetSerializedSize(), 0));
         newp->AddHeader(seqh);
 
         Ipv4Header head;
-        head.SetDestination(Ipv4Address(longHaulState.longHaulCh.sip));
-        head.SetSource(Ipv4Address(longHaulState.longHaulCh.dip));
+        head.SetDestination(Ipv4Address(peer.routeHeader.sip));
+        head.SetSource(Ipv4Address(peer.routeHeader.dip));
         head.SetProtocol(0x6); //tcp
         head.SetTtl(64);
         head.SetPayloadSize(newp->GetSize());
@@ -876,7 +880,7 @@ void atcGateway::GenerateLongHaulFeedback() {
         MyPriorityTag pri;
         pri.SetPriority(0);
         newp->AddPacketTag(pri);
-        newp->AddPacketTag(InterfaceTag(longHaulState.longHaulIngressIfIndex));
+        newp->AddPacketTag(InterfaceTag(ingressIfIndex));
 
         CustomHeader bfCh(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
         newp->PeekHeader(bfCh);
@@ -886,25 +890,14 @@ void atcGateway::GenerateLongHaulFeedback() {
             PrintAtcDebugSummary("periodic-longhaul");
         }
 
-        if (longHaulState.firstFeedback) {
-            longHaulState.firstFeedback = false;
-            longHaulState.lastFeedbackTime = Simulator::Now();
-        }
-        else
-        {
-            // 定期重置发送统计
-            if (Simulator::Now() - longHaulState.lastFeedbackTime > Seconds(1.0)) {
-                longHaulState.remoteForwardedBytes = 0;
-                longHaulState.lastFeedbackTime = Simulator::Now();
-            }
-        }
-
         if (m_debug & 0x2)
-            printf("+++atcGateway  send LongHaulFeedback remoteForwardedBytes:%lu, activeVoqCount:%d  time:%f\n",longHaulState.remoteForwardedBytes,longHaulState.activeVoqCount,Simulator::Now().GetSeconds());
+            printf("+++atcGateway  send LongHaulFeedback remoteForwardedBytes:%lu, activeVoqCount:%d  time:%f node:%u peerIf:%u peerSip:%u\n",peer.remoteForwardedBytes,longHaulState.activeVoqCount,Simulator::Now().GetSeconds(),peer.nodeId,ingressIfIndex,peer.routeHeader.sip);
     }
 
     // 重置定时器
-    StartLongHaulFeedbackTimer();
+    if (!longHaulFeedbackPeers.empty()) {
+        StartLongHaulFeedbackTimer();
+    }
 }
 
 

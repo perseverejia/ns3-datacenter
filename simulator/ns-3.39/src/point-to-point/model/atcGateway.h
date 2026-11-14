@@ -7,7 +7,6 @@
 #include <unordered_map>
 #include <vector>
 #include <bitset>
-#include <unordered_set>
 
 #include "ns3/address.h"
 #include "ns3/callback.h"
@@ -117,14 +116,15 @@ struct LongHaulState {
     uint64_t rateLimit;                // 速率限制（bps）
     uint64_t longHaulBandwidth;
     Time longHaulDelay;
-    Time lastFeedbackTime;
-    bool firstFeedback;
-    CustomHeader longHaulCh;
-    bool longHaulChFlag;
-    uint32_t longHaulIngressIfIndex;
-    std::unordered_set<uint32_t> longHaulSrcIps; // 远端源IP地址
 };
 
+// Receiver accounting is per WAN ingress, matching one source gateway's
+// aggregate localSentBytes. Several source hosts on that WAN share one counter.
+struct LongHaulFeedbackPeer {
+    CustomHeader routeHeader;
+    uint64_t remoteForwardedBytes = 0;
+    uint32_t nodeId = 0;
+};
 
 
 
@@ -166,6 +166,7 @@ public:
 
     // 长距离控制
     LongHaulState longHaulState;
+    std::map<uint32_t, LongHaulFeedbackPeer> longHaulFeedbackPeers;
     EventId longHaulFeedbackEvent;
 
     int m_debug;
@@ -242,6 +243,9 @@ public:
 
     // 初始化长距离状态
     void InitLongHaulState(uint64_t longHaulBandwidth,Time longHaulDelay);
+    void RegisterLongHaulPeer(uint32_t ingressIfIndex, uint32_t nodeId,
+                              const CustomHeader& ch);
+    void RecordRemoteForwarded(Ptr<const Packet> packet);
     // 启动长距离反馈定时器
     void StartLongHaulFeedbackTimer();
      // 生成长距离反馈

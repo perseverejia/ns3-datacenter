@@ -11,6 +11,7 @@
 #include "grc-settings.h"
 #include "grc-wan-routing.h"
 #include "qbb-net-device.h"
+#include "qbb-channel.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
 #include "ns3/simulator.h"
@@ -1153,6 +1154,35 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
     }
     
     m_gatewayType = gatewayType;
+
+    // The topology marks WAN devices before gateway initialization. Obtain the
+    // physical parameters here instead of leaving the ATC fields at zero or
+    // copying whichever WAN link the driver happened to read last.
+    uint32_t wanPorts = 0;
+    uint32_t firstWanPort = 0;
+    for (uint32_t port = 1; port < GetNDevices(); ++port) {
+        Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(GetDevice(port));
+        if (!device || !device->IsWanPort())
+            continue;
+        Ptr<QbbChannel> channel = DynamicCast<QbbChannel>(device->GetChannel());
+        NS_ABORT_MSG_IF(!channel, "ATC WAN device requires a QbbChannel");
+        if (wanPorts++ == 0) {
+            firstWanPort = port;
+            m_atcConfig.long_haul_bandwidth = device->GetDataRate().GetBitRate();
+            m_atcConfig.long_haul_delay = channel->GetDelay();
+        }
+    }
+    NS_ABORT_MSG_IF(wanPorts == 0 || m_atcConfig.long_haul_bandwidth == 0,
+                    "ATC gateway requires a topology-marked WAN link");
+    // Source accounting and the existing rate actuator describe one WAN link.
+    // Destination gateways may receive independently accounted peers on several
+    // WAN ports; their own long-haul rate/threshold are not used for control.
+    NS_ABORT_MSG_IF(gatewayType == 1 && wanPorts != 1,
+                    "ATC source aggregate accounting requires one WAN interface");
+    std::cout << "[ATC] Switch " << GetId() << " WAN parameters from port "
+              << firstWanPort << ": bandwidth=" << m_atcConfig.long_haul_bandwidth
+              << "bps delay=" << m_atcConfig.long_haul_delay.GetNanoSeconds()
+              << "ns WAN ports=" << wanPorts << std::endl;
     
     // 配置 ATC 参数
     m_atcGateway.ConfigureAtcParams(
