@@ -24,6 +24,7 @@ public:
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
+	uint32_t m_winFloor; // one recovery chunk when go-back-to-zero is enabled
 	uint64_t m_baseRtt; // base RTT of this qp
 	DataRate m_max_rate; // max rate
 	bool m_var_win; // variable window size
@@ -115,7 +116,7 @@ public:
 	struct {
 		uint16_t m_bottleneckCpId;       // 瓶颈拥塞点ID (Switch节点ID 12位+PortID 4位)
 		DataRate m_bottleneckRate;       // 瓶颈速率
-		Time m_lastBottleneckUpdate;     // 上次瓶颈更新时间
+		Time m_lastBottleneckUpdate;     // 上次瓶颈更新时刻
 		bool m_timerExpired;             // 定时器是否超时
 	} frp;
 
@@ -169,7 +170,7 @@ public:
 	uint16_t m_ipid;
 	uint32_t ReceiverNextExpectedSeq;
 	Time m_nackTimer;
-	int32_t m_milestone_rx;
+	uint32_t m_milestone_rx;
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	uint64_t m_recv_bytes; // 累计按序接收的 payload 字节数（用于接收侧 goodput 统计）

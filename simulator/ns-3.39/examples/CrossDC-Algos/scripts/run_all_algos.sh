@@ -25,6 +25,7 @@ declare -a ALGOS=(
     "14:ROCC"
     "12:Bifrost"
     "18:GRC"
+    "19:THEMIS"
 )
 
 # 检查是否指定了特定的算法

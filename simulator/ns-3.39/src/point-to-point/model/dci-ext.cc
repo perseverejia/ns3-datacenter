@@ -342,6 +342,8 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         // ACK 序号差分累计（乱序期重复 NACK 序号相同 -> 增量 0，自动幂等）
         uint32_t ackSeq = ch.ack.seq;
         if (ackSeq > f.ackWatermark) {
+            if (f.winAckBytes == 0)
+                f.winFirstAckT = Simulator::Now(); // 本窗首个 ACK（首窗归一分母）
             f.winAckBytes += (uint64_t)(ackSeq - f.ackWatermark);
             f.ackWatermark = ackSeq;
 
@@ -584,7 +586,7 @@ void DciExt::SndTick() {
 //           使 R_avbl ≈ txRate × RTT_t/RTT，即目标延迟比侧速率控制；
 //           1/D、1/Dt 两项分子为 1 字节量级，仅作微调；clamp 到 B）
 //   4~5. R_avbl 保持 DIP 级总量语义（分支 a = ACK 总速率，分支 c = 公式结果）。
-//      分配：每流份额 = R_avbl / ceilPow2(N)（N=2 → /2；N=3 → 取 4）；
+//      分配：每流份额 = R_avbl / N（N 为活跃跨域流数，直接除以 N，不再上取 2 的幂）；
 //      表二：每 SenderDC 份额 = 每流份额 × 该DC流数
 //      （例：R_avbl=25.6G，N=3（DC A 2 条 + DC B 1 条）→ A = 25.6/4×2 = 12.8G，B = 25.6/4 = 6.4G）
 //      （每流下限兜底 B/64，防 ACK 断流期反馈 0 配额死锁）
@@ -607,6 +609,7 @@ void DciExt::PeriodicTick() {
         uint32_t n = 0;
         uint64_t ackBytes = 0;
         uint64_t txBytes = 0;   // 上个T DCI→DC 出队字节（W）
+        Time firstAckT = Seconds(-1); // 本窗各流最早的首个 ACK 时刻
         uint32_t rttCnt = 0;
         double rttSumUs = 0;
         double rttMinUs = 1e18;
@@ -624,6 +627,9 @@ void DciExt::PeriodicTick() {
         a.n++;
         a.ackBytes += f.winAckBytes;
         a.txBytes += f.winTxBytes;
+        if (f.winAckBytes > 0 && f.winFirstAckT >= Seconds(0) &&
+            (a.firstAckT < Seconds(0) || f.winFirstAckT < a.firstAckT))
+            a.firstAckT = f.winFirstAckT;
         if (f.rttCnt > 0) {
             a.rttCnt += f.rttCnt;
             a.rttSumUs += f.rttSumUs;
@@ -634,6 +640,7 @@ void DciExt::PeriodicTick() {
         if (a.senderSip[f.inPort] == 0)
             a.senderSip[f.inPort] = f.sip;
         f.winAckBytes = 0; // 周期清零
+        f.winFirstAckT = Seconds(-1);
         f.winTxBytes = 0;
         f.rttCnt = 0;
         f.rttSumUs = 0;
@@ -657,7 +664,9 @@ void DciExt::PeriodicTick() {
         bool stalled = ackRateBps < m_dipBwBps / 10.0;
 
         // RTT_base = 运行最小值（首个样本初始化，之后只降不升）
-        if (!stalled && a.rttCnt > 0 && a.rttMinUs < rd.rttBaseUs) {
+        // 过滤 < 20us 的异常采样（PFC 锁闭/解锁瞬间 ACK 水位差分失真，
+        // 会把 base 拉到物理不可能值，导致 PROBE 区间整体下移失效）
+        if (!stalled && a.rttCnt > 0 && a.rttMinUs >= 20.0 && a.rttMinUs < rd.rttBaseUs) {
             rd.rttBaseUs = a.rttMinUs;
             rd.hasRttBase = true;
         }
@@ -668,7 +677,16 @@ void DciExt::PeriodicTick() {
         } else if (!rd.hasRAvbl) {
             // a. 首次获取 DIP 可用带宽：直接用 ACK 返回速率
             if (ackRateBps > 0) {
-                rd.rAvblBps = ackRateBps; // DIP 级总量：ACK 总速率
+                // 首窗 ACK 只占窗口尾部（数据经 WAN 到达时刻与窗口边界无对齐），
+                // 按"首个 ACK 到达 → 本窗结算"的活跃时长归一，消除窗口相位稀释
+                double activeSec = (a.firstAckT >= Seconds(0))
+                                       ? (now - a.firstAckT).GetSeconds() : tSec;
+                if (activeSec <= 0 || activeSec > tSec)
+                    activeSec = tSec; // 防御：异常时退回整窗口径
+                double firstRateBps = (double)a.ackBytes * 8.0 / activeSec;
+                if (firstRateBps > m_dipBwBps)
+                    firstRateBps = m_dipBwBps; // clamp 到 DIP 带宽上界
+                rd.rAvblBps = firstRateBps; // DIP 级总量：首窗活跃时长归一
                 rd.hasRAvbl = true;
                 branch = "FIRST_ACK";
             } else {
@@ -697,19 +715,15 @@ void DciExt::PeriodicTick() {
                 branch = "CONGESTED";
             } else {
                 // c. RTT < RTT_t - sigma：队列低于目标，增速探测
-                //   Wt = (1/D − 1/Dt + W/RTT) × RTT_t；R_avbl = Wt/T
+                //   Wt = (W/RTT) × RTT_t（已移除 1/D − 1/Dt 项：该项在 D→0 时
+                //   发散，导致低 RTT 窗口 R_avbl 直冲 B 顶格，跨域流借 PROBE 抢占）
                 if (a.txBytes == 0) {
                     branch = "PROBE_SKIP"; // 本窗无实际发送，W 无数据可判，保持不变
                 } else {
-                double dUs = rttAvgUs - rd.rttBaseUs;
-                if (dUs < 1e-3)
-                    dUs = 1e-3; // 防除零（RTT 恰为历史最小值）
-                double Ds = dUs * 1e-6;           // D（s）
-                double dtS = m_dtUs * 1e-6;        // Dt（s）
                 double RTTs = rttAvgUs * 1e-6;     // 上个T实测RTT（s）
                 double rttTs = rttT * 1e-6;        // RTT_t（s）
                 double W = (double)a.txBytes;      // 上个T DCI→DC 发送量（B）
-                double Wt = (1.0 / Ds - 1.0 / dtS + W / RTTs) * rttTs;
+                double Wt = (W / RTTs) * rttTs;
                 double rNewBps = Wt / tSec * 8.0; // Wt 为字节 → ×8 转 bps（与 ackRateBps 口径一致）
                 if (rNewBps > m_dipBwBps)
                     rNewBps = m_dipBwBps;      // clamp 到 B
@@ -723,10 +737,16 @@ void DciExt::PeriodicTick() {
             branch = "NO_SAMPLE"; // 尚无 RTT 样本：保持不变
         }
 
-        // 记录本周期分支，供下周期 STEADY 的回弹限制使用
-        // （STALL_HOLD 的 RTT 统计不可信，保持原值不更新）
-        if (branch != "STALL_HOLD")
-            rd.lastCongested = (branch == "CONGESTED");
+        // // 记录本周期分支，供下周期 STEADY 的回弹限制使用
+        // // （STALL_HOLD 的 RTT 统计不可信，保持原值不更新）
+        // // 粘性防回弹锁：CONGESTED 进入锁定，STEADY_HOLD 维持锁定，
+        // //   只有 PROBE（RTT 跌破下界）等离开区间的分支才解锁
+        // if (branch != "STALL_HOLD") {
+        //     if (branch == "CONGESTED" || branch == "STEADY_HOLD")
+        //         rd.lastCongested = true;    // 进入或维持防回弹锁
+        //     else
+        //         rd.lastCongested = false;   // PROBE / STEADY / 其他 → 解锁
+        // }
 
         if (m_debug) {
             printf("[DCIEXT_STATS] %lu node=%u dip=0x%08x N=%u txRate=%.3fG ackRate=%.3fG "
@@ -742,13 +762,9 @@ void DciExt::PeriodicTick() {
                    a.rttCnt, branch, rd.rAvblBps / 1e9);
         }
 
-        // 4. 分配：移位除法，N 上取 2 的幂 P，每流份额 = R_avbl >> log2(P)
-        uint32_t p = 1, shift = 0;
-        while (p < a.n) {
-            p <<= 1;
-            shift++;
-        }
-        uint64_t perFlow = (uint64_t)rd.rAvblBps >> shift;
+        // 4. 分配：每流份额 = R_avbl / N（N 为活跃跨域流数，不再上取 2 的幂，
+        //    消除 N=3 时按 4 均分浪费 1/4 配额的问题）
+        uint64_t perFlow = (a.n > 0) ? (uint64_t)(rd.rAvblBps / a.n) : 0;
         // 兜底下限：ACK 差分瞬态归零时不得反馈 0 配额（否则发送方 ratio=0
         // → n=MAX 连发 → 永久死锁）。下限 dipBw/64（625Mbps）只作恢复期兜底
         uint64_t minPerFlow = (uint64_t)m_dipBwBps >> 6;
@@ -756,7 +772,7 @@ void DciExt::PeriodicTick() {
             perFlow = minPerFlow;
 
         for (auto &sc : a.senderCounts) {
-            // 5. 表二：每 SenderDC 分得 (R_avbl/ceilPow2(N)) × 该DC流数
+            // 5. 表二：每 SenderDC 分得 (R_avbl/N) × 该DC流数
             double rAvblBps = (double)perFlow * sc.second;
             uint32_t dstIp = a.senderSip[sc.first];
             if (m_debug) {

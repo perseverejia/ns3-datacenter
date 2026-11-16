@@ -88,6 +88,8 @@ def analyze_query_flow_fct(query_fct_file):
 
     print(f"{'='*80}\n")
 
+    return flows
+
 
 # 脚本位置: examples/CrossDC-Algos/scripts/run_single_workload_algo.py
 # 需要回退 4 层到 ns-3.39 根目录
@@ -100,7 +102,7 @@ RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
 PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
 TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
-PLOTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "plots")
+PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
 ANALYSIS_DIR = os.path.join(RESULTS_DIR, "analysis")
 ATC_ALGO_MODE = 15
 ATC_BASE_CC_MODE = 1
@@ -564,10 +566,12 @@ def run_and_plot(args):
             if m:
                 totals["background"] = int(m.group(1))
 
-            if "[DCQCN_QLEN]" in line and sim_cc_mode in (1, 3, 7, 16, 17, 18):
+            if "[DCQCN_QLEN]" in line and sim_cc_mode in (1, 3, 7, 16, 17, 18, 19):
                 # ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
+                # 防御：stdio 缓冲竞态可能把 [TX RATE]/[DCIEXT_CNP] 等行与本行拼接，
+                # 拼接行 parts[2] 是 'Host'/'node=..' 等非数字字段，跳过即可
                 parts = line.split()
-                if len(parts) >= 5:
+                if len(parts) >= 5 and parts[2].isdigit() and parts[3].isdigit():
                     sw = int(parts[2])
                     port = int(parts[3])
                     t_ms = float(parts[1]) / 1e9 * 1000
@@ -691,7 +695,7 @@ def run_and_plot(args):
         pfc_by_flow = map_pfc_events_to_flows(pfc_events, port_map, topo_adj, sorted(tx_rates))
         os.makedirs(TXRATE_DIR, exist_ok=True)
         tx_rate_output_file = os.path.join(
-            PLOTS_DIR,
+            TXRATE_DIR,
             f"workload_txrate_{args.algo_name.lower()}_cc{args.ccMode}_load{load_tag(load)}.png",
         )
         if tx_rates:
@@ -778,8 +782,9 @@ def run_and_plot(args):
         if tx_rates:
             print(f"TX RATE image file: {tx_rate_output_file}")
 
+        query_flows = []
         if os.path.exists(query_fct_out):
-            analyze_query_flow_fct(query_fct_out)
+            query_flows = analyze_query_flow_fct(query_fct_out)
 
         # 写入分析数据到文件
         os.makedirs(ANALYSIS_DIR, exist_ok=True)
@@ -820,6 +825,25 @@ def run_and_plot(args):
                 af.write(f"P99 FCT: {np.percentile(fct_ms, 99):.6f} ms\n")
             else:
                 af.write("No completed flow data\n")
+
+            # 逐流 FCT 明细（与终端 Query Flow FCT Analysis 表格一致）
+            af.write(f"\n{'='*80}\n")
+            af.write("Query Flow FCT Detail\n")
+            af.write(f"{'='*80}\n")
+            if query_flows:
+                af.write(f"{'No.':<6} {'Src':<8} {'Dst':<8} {'PG':<6} {'Dport':<8} "
+                         f"{'Size(MB)':<10} {'Start(ms)':<12} {'FCT(ms)':<12} {'Cross-DC':<10}\n")
+                af.write("=" * 80 + "\n")
+                for idx, flow in enumerate(query_flows, 1):
+                    size_mb = flow["size"] / (1024 * 1024)
+                    start_ms = flow["start_ns"] / 1e6
+                    fct_ms = flow["fct_ns"] / 1e6
+                    cross_dc = "Yes" if flow["is_cross_dc"] == 1 else "No"
+                    af.write(f"{idx:<6} {flow['src']:<8} {flow['dst']:<8} {flow['pg']:<6} {flow['dport']:<8} "
+                             f"{size_mb:<10.2f} {start_ms:<12.3f} {fct_ms:<12.3f} {cross_dc:<10}\n")
+                af.write("=" * 80 + "\n")
+            else:
+                af.write("No query flow FCT data\n")
             
             # PFC 统计
             af.write(f"\n{'='*80}\n")
@@ -919,6 +943,7 @@ Algorithm ccMode Mapping:
   dciext     -> ccMode=16  (DCI-Ext: 接收侧 DCI 端口门控 + 逐流 CNP，部署交换机由 GATEWAY_DST 指定)
   epfc       -> ccMode=17  (ePFC: PFC 的流级扩展，所有交换机打标 + 边缘交换机沿 CCF 反馈掐断贡献者流)
   grc        -> ccMode=18  (GRC: DCI 网侧控制，端侧复用现有 DCQCN)
+  themis     -> ccMode=19  (THEMIS: PNP/TRP，端侧复用现有 DCQCN)
 
 Examples:
   python3 run_single_workload_algo.py 1 DCQCN
@@ -927,6 +952,7 @@ Examples:
   python3 run_single_workload_algo.py 16 DCIEXT
   python3 run_single_workload_algo.py 17 EPFC
   python3 run_single_workload_algo.py 18 GRC
+  python3 run_single_workload_algo.py 19 THEMIS
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

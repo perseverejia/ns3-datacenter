@@ -54,6 +54,7 @@ struct DciExtRcvFlow {
     uint32_t inPort;         // 长链路入端口（ifIndex）= SenderDC 标识
     uint32_t ackWatermark;   // ACK 累计确认水位（全局累计，差分进 winAckBytes）
     uint64_t winAckBytes;    // 本周期 ACK 确认字节（DIP ACK 反馈速率口径）
+    Time winFirstAckT;       // 本周期首个 ACK 到达时刻（首窗归一分母；-1s=本窗无ACK）
     uint64_t winTxBytes;     // 本周期 DCI→DC 出队字节（txRate 口径，纯DC内RTT打点同源）
     uint32_t rttCnt;         // 本周期 RTT 样本数
     double rttSumUs;         // 样本和（us）
@@ -63,7 +64,8 @@ struct DciExtRcvFlow {
     Time lastActive;         // 老化用（数据包或 ACK 到达即刷新）
 
     DciExtRcvFlow() : sip(0), dip(0), sport(0), dport(0), pg(0), inPort(0),
-                      ackWatermark(0), winAckBytes(0), winTxBytes(0),
+                      ackWatermark(0), winAckBytes(0), winFirstAckT(Seconds(-1)),
+                      winTxBytes(0),
                       rttCnt(0), rttSumUs(0), rttMinUs(1e18), rttMaxUs(0),
                       lastActive(Seconds(0)) {}
 };

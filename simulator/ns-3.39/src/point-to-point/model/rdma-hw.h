@@ -26,6 +26,7 @@ public:
 
 	static TypeId GetTypeId (void);
 	RdmaHw();
+	bool UsesDcqcn() const;
 
 	Ptr<Node> m_node;
 	DataRate m_minRate;		//< Min sending rate

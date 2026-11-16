@@ -32,6 +32,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_pg = pg;
 	m_ipid = 0;
 	m_win = 0;
+	m_winFloor = 0;
 	m_baseRtt = 0;
 	m_max_rate = 0;
 	m_var_win = false;
@@ -128,6 +129,8 @@ uint32_t RdmaQueuePair::GetHash(void) {
 void RdmaQueuePair::Acknowledge(uint64_t ack) {
 	if (ack > snd_una) {
 		snd_una = ack;
+		if (snd_nxt < snd_una)
+			snd_nxt = snd_una;
 	}
 }
 
@@ -140,6 +143,8 @@ bool RdmaQueuePair::IsWinBound() {
 	if (m_epfcPauseUntil > Simulator::Now())
 		return true;
 	uint64_t w = GetWin();
+	if (w != 0 && w < m_winFloor)
+		w = m_winFloor;
 	return w != 0 && GetOnTheFly() >= w;
 }
 
