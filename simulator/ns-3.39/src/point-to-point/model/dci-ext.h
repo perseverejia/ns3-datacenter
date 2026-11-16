@@ -2,7 +2,7 @@
 #define DCI_EXT_H
 
 // DCIExt: OBSERVE -> CNP 初始化(alpha≈0.2) -> 每 T 查表控制。
-// 仅启动阶段按已发 CNP 建模 alpha；普通控制沿用构造时预计算的固定表。
+// 全程按已发 CNP 追踪 alpha；普通控制按该流当前状态预测CNP数。
 // 接收侧沿用原 RTT/ACK 三分支，无新增 RTT 或 ACK 平滑。
 
 #include <map>
@@ -54,7 +54,7 @@ struct DciExtRcvDip {
     DciExtRcvDip() : rAvblBps(0), hasRAvbl(false), rttBaseUs(1e18), hasRttBase(false), lastCongested(false) {}
 };
 
-// 仅用于启动 CNP 序列的原生 alpha 时钟；不参与普通控制查表。
+// 按DCI发出的全部CNP维护alpha；预测使用副本，不提前改变真实追踪状态。
 struct DciExtInitCnpState {
     bool initialized = false;
     bool pending = false;
@@ -73,7 +73,7 @@ struct DciExtSndFlow {
     uint32_t burstRemaining; // 本轮待连发 CNP 个数
     EventId burstEvent;
     Time lastActive;
-    DciExtInitCnpState cnp;       // 仅用于启动 CNP 初始化
+    DciExtInitCnpState cnp;       // 全程追踪已发CNP
     uint32_t ackWatermark;   // ACK 累计确认水位（回程差分扣减 Inflight 用）
     std::map<uint32_t, Time> dataArrival; // seq -> 出长链路时刻（RTT_cross 采样匹配）
 
@@ -131,7 +131,7 @@ public:
     void SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps); // 0xFA 反馈
     void InitCnpTick(DciExtFlowKey key);          // CNP序列初始化alpha，完成后无额外等待
     void BurstTick(DciExtFlowKey key);              // 连发定时器回调
-    uint32_t LookupN(double ratio) const;           // 查表: 目标压制比例 -> 连发个数 n
+    uint32_t LookupN(double ratio, const DciExtInitCnpState& state) const;
     double ComputeV(DciExtSndDip &e, double tSec);  // 原配额调整：首个跨域 RTT 前为 P，之后为 0.9P
 
     bool m_debug;                 // 日志开关
@@ -139,7 +139,6 @@ public:
     bool m_senderSide;            // 发送方 DCI（表A/观察期/ECN反馈），否则接收方（表一/二）
 
 private:
-    void BuildTable();            // 构造时一次初始化固定乘子表
     static void AdvanceAlpha(DciExtInitCnpState &state, int64_t nowNs);
     static void RecordCnp(DciExtInitCnpState &state, int64_t nowNs);
 
@@ -150,8 +149,6 @@ private:
     uint32_t m_agingPeriods;      // 流老化时长 = N 个周期 T
     double m_dtUs;                // 期望排队时延 Dt（RTT_t = RTT_base + Dt）
     double m_sigmaUs;             // RTT 目标区间容差 sigma
-
-    double m_M[MAX_BURST_N + 1];  // M[n]: 连发 n 个 CNP 后速率与原速率之比（查表用）
 
     Callback<void, Ptr<Packet>, CustomHeader&> m_sendCb;
     Callback<Ptr<QbbNetDevice>, Ptr<Packet>, CustomHeader&> m_getOutDevCb;

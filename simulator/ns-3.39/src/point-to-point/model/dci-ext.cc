@@ -21,7 +21,6 @@ DciExt::DciExt()
       m_periodT(MicroSeconds(400)),
       m_dipBwBps(0), m_observeBytes(1000000ULL),
       m_agingPeriods(2), m_dtUs(4), m_sigmaUs(3) {
-    BuildTable();
     m_periodEvent = EventId();
 }
 
@@ -65,34 +64,22 @@ bool DciExt::IsLongLinkPort(Ptr<NetDevice> dev) const {
     return (qdev != nullptr && qdev->IsWanPort());
 }
 
-void DciExt::BuildTable() {
-    // 原方案固定乘子表：在 DciExt 构造时初始化一次，之后只查表。
-    // CNP 每 4us 一个（与刀消费 4us 对齐）；α 每 1us 更新：
-    //   到达的 1us  α <- (1-g)α + g，随后 3us x(1-g)^3；
-    // 每 4us 末消费一刀 m *= (1 - α/2)（单刀约 -10%，n 刀合成见表）
-    const double g = 1.0 / 256.0;      // EWMA_GAIN（必须与端侧 config EWMA_GAIN 一致）
-    const double alpha0 = 0.2;         // 原方案固定查表起点
-    m_M[0] = 1.0;
-    double alpha = alpha0;
-    double m = 1.0;
-    for (uint32_t n = 1; n <= MAX_BURST_N; n++) {
-        alpha = (1.0 - g) * alpha + g;           // CNP 到达的 1us
-        for (int k = 0; k < 3; k++)
-            alpha *= (1.0 - g);                  // 随后 3us 衰减
-        m *= (1.0 - alpha / 2.0);                // 4us 末消费一刀
-        m_M[n] = m;
-    }
-}
-
 // 目标压制比例 r（希望速率变为原来的 r 倍）-> 最小 n 使 M[n] <= r
-uint32_t DciExt::LookupN(double ratio) const {
+uint32_t DciExt::LookupN(double ratio, const DciExtInitCnpState& state) const {
     if (ratio >= 1.0)
         return 0;
     // n 上限 80：极端 ratio（<0.1）时查表会给到百级连发，端侧刀链每 4us
     // 消费一次仍会连砍 20+ 刀直接砍崩——保险丝限幅
     const uint32_t maxN = 80;
-    for (uint32_t n = 0; n <= maxN; n++) {
-        if (m_M[n] <= ratio)
+    auto predicted = state;
+    int64_t when = Simulator::Now().GetNanoSeconds();
+    double multiplier = 1;
+    for (uint32_t n = 1; n <= maxN; n++) {
+        RecordCnp(predicted, when);
+        when += m_burstInterval.GetNanoSeconds();
+        AdvanceAlpha(predicted, when);
+        multiplier *= 1 - predicted.alpha / 2;
+        if (multiplier <= ratio)
             return n;
     }
     return maxN;
@@ -143,23 +130,23 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                 double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
                 if (e.sndRateBps > effBps) {
                     double ratio = effBps / e.sndRateBps;
-                    uint32_t n = LookupN(ratio);
-                    if (n == 0)
-                        n = 1;
-                    if (m_debug) {
-                        printf("[DCIEXT_CNP] %lu node=%u type=OVERLOAD n=%u dip=0x%08x "
-                               "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
-                               now.GetTimeStep(), m_nodeId, n, dip,
-                               e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
-                               (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
-                               e.rttCrossMaxUs, ratio);
-                    }
                     for (auto &kv : m_sndFlows) {
                         DciExtSndFlow &f = kv.second;
                         if (f.dip != dip || f.state != DciExtSndFlow::CTL)
                             continue;           // 观察/静默期流不受本轮压制
                         if (f.burstRemaining > 0)
                             continue;           // 已有 burst 在发，避免并发
+                        uint32_t n = LookupN(ratio, f.cnp);
+                        if (n == 0)
+                            n = 1;
+                        if (m_debug) {
+                            printf("[DCIEXT_CNP] %lu node=%u type=OVERLOAD n=%u dip=0x%08x "
+                                   "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
+                                   now.GetTimeStep(), m_nodeId, n, dip,
+                                   e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
+                                   (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
+                                   e.rttCrossMaxUs, ratio);
+                        }
                         f.burstRemaining = n;
                         BurstTick(kv.first);
                     }
@@ -204,6 +191,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                 DciExtFlowKey key(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
                 bool isNew = (m_sndFlows.find(key) == m_sndFlows.end());
 
+                const bool fastCnp = ch.GetIpv4EcnBits() != 0;
                 // ECN 快速反馈（观察期照常）：清 ECN 位 + 立即 CNP
                 if (ch.GetIpv4EcnBits() != 0) {
                     PppHeader ppp;
@@ -218,7 +206,6 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                         printf("[DCIEXT_ECN] %lu node=%u type=FAST_CNP sip=0x%08x sport=%u dport=%u\n",
                                Simulator::Now().GetTimeStep(), m_nodeId, ch.sip, ch.udp.sport, ch.udp.dport);
                     }
-                    SendCnpForFlow(key);
                 }
 
                 if (isNew) {
@@ -249,6 +236,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                         }
                     }
                 }
+                if (fastCnp) SendCnpForFlow(key);
             }
         }
         return false; // 数据包照常转发（ECN 已被清除）
@@ -488,23 +476,23 @@ void DciExt::SndTick() {
             double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
             if (e.sndRateBps > effBps) {
                 double ratio = effBps / e.sndRateBps;
-                uint32_t n = LookupN(ratio);
-                if (n == 0)
-                    n = 1;
-                if (m_debug) {
-                    printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
-                           "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
-                           now.GetTimeStep(), m_nodeId, n, kv.first,
-                           e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
-                           (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
-                           e.rttCrossMaxUs, ratio);
-                }
                 for (auto &fkv : m_sndFlows) {
                     DciExtSndFlow &f = fkv.second;
                     if (f.dip != kv.first || f.state != DciExtSndFlow::CTL)
                         continue;
                     if (f.burstRemaining > 0)
                         continue;
+                    uint32_t n = LookupN(ratio, f.cnp);
+                    if (n == 0)
+                        n = 1;
+                    if (m_debug) {
+                        printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
+                               "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
+                               now.GetTimeStep(), m_nodeId, n, kv.first,
+                               e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
+                               (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
+                               e.rttCrossMaxUs, ratio);
+                    }
                     f.burstRemaining = n;
                     BurstTick(fkv.first);
                 }
@@ -688,6 +676,8 @@ void DciExt::PeriodicTick() {
                    a.rttCnt, branch, rd.rAvblBps / 1e9);
         }
 
+        if (!rd.hasRAvbl) continue; // 尚无有效参考，不发送占位配额
+
         // 4. 分配：移位除法，N 上取 2 的幂 P，每流份额 = R_avbl >> log2(P)
         uint32_t p = 1, shift = 0;
         while (p < a.n) {
@@ -756,8 +746,7 @@ void DciExt::SendCnpForFlow(const DciExtFlowKey &key) {
     CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
     newp->PeekHeader(ch);
     if (!m_sendCb.IsNull()) {
-        if (f.state != DciExtSndFlow::CTL)
-            RecordCnp(f.cnp, Simulator::Now().GetNanoSeconds());
+        RecordCnp(f.cnp, Simulator::Now().GetNanoSeconds());
         m_sendCb(newp, ch);
     }
 }

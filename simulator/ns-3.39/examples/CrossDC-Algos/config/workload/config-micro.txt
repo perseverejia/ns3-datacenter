@@ -95,7 +95,7 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(10MB→CNP初始化→T周期查表)
+# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(1MB→CNP初始化→T周期查表)
 #                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 配额消费
 # 接收方 DCI（节点 22）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # 注意：本配置解析器逐 token 读取，注释中不要出现裸的配置键名
@@ -109,7 +109,7 @@ DCIEXT_DT_US 4
 # 固定 RTT 目标区间半宽；沿用原 ACK/RTT 三分支更新
 DCIEXT_SIGMA_US 3
 # 新流观察期（整数 MB）；达到阈值后执行 CNP 初始化，再每 T 查表调速
-DCIEXT_OBSERVE_MB 10
+DCIEXT_OBSERVE_MB 1
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
 # micro 发送方 DCI 交换机列表（四个场景共用 SW21、SW23）
