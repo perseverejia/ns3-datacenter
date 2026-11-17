@@ -1,7 +1,8 @@
 #include "dci-ext.h"
 
-#include <cmath>
+#include <algorithm>
 #include <cstdio>
+#include <iterator>
 
 #include "ns3/custom-priority-tag.h"
 #include "ns3/ipv4-header.h"
@@ -15,28 +16,73 @@ namespace {
 constexpr uint64_t kDciExtMinRateBps = 1000000000ULL; // 停滞门限、探测下界及每流配额下界：1Gbps
 }
 
+void DciExtRcvFlow::RecordTx(uint32_t seq, uint32_t size, Time now) {
+    if (seq < ackWatermark)
+        return; // 已确认字节的重复包不能重新成为 RTT 样本。
+    bool ambiguous = (uint64_t)seq < txWatermark;
+    auto inserted = dataArrival.emplace(seq, DciExtRttStamp{now, ambiguous});
+    if (!inserted.second)
+        inserted.first->second.ambiguous = true; // 保留首次时间戳，不匹配到后来的重传。
+    txWatermark = std::max(txWatermark, (uint64_t)seq + size);
+}
+
+bool DciExtRcvFlow::TakeRttSample(uint32_t ackSeq, Time now, Time& rtt) {
+    auto end = dataArrival.lower_bound(ackSeq); // ACK 只确认 seq < ackSeq。
+    if (end == dataArrival.begin())
+        return false;
+    auto sample = std::prev(end);
+    bool valid = !sample->second.ambiguous && now > sample->second.sent;
+    if (valid)
+        rtt = now - sample->second.sent;
+    dataArrival.erase(dataArrival.begin(), end);
+    return valid;
+}
+
 DciExt::DciExt()
     : m_debug(true), m_nodeId(0), m_senderSide(false),
       m_burstInterval(MicroSeconds(4)),
       m_periodT(MicroSeconds(400)),
-      m_dipBwBps(0), m_observeBytes(1000000ULL),
+      m_dipBwBps(0), m_observeBytes(20ULL << 20), m_silentUs(MicroSeconds(400)),
       m_agingPeriods(2), m_dtUs(4), m_sigmaUs(3) {
+    BuildTable();
     m_periodEvent = EventId();
 }
 
+DciExt::~DciExt() {
+    Dispose();
+}
+
+void DciExt::Dispose() {
+    Simulator::Remove(m_periodEvent);
+    Simulator::Remove(m_sndTickEvent);
+    m_periodEvent = EventId();
+    m_sndTickEvent = EventId();
+    for (auto& entry : m_sndFlows)
+        Simulator::Remove(entry.second.burstEvent);
+    m_sndFlows.clear();
+    m_sndDips.clear();
+    m_rcvFlows.clear();
+    m_rcvWatermarks.clear();
+    m_rcvDips.clear();
+    m_sendCb.Nullify();
+    m_getOutDevCb.Nullify();
+    m_getDevCb.Nullify();
+}
+
 void DciExt::Configure(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                       uint64_t dipBwBps, uint64_t observeMb,
+                       uint64_t dipBwBps, uint64_t observeMb, uint32_t silentUs,
                        uint32_t agingPeriods, double dtUs, double sigmaUs) {
     m_nodeId = nodeId;
     m_burstInterval = MicroSeconds(burstIntervalUs);
     m_periodT = MicroSeconds(periodTUs);
     m_dipBwBps = dipBwBps; // B = 拓扑中的服务器接入带宽，收发两侧一致
-    m_observeBytes = observeMb * 1000000ULL;
+    m_observeBytes = observeMb << 20; // 沿用 dcix 的 MiB 单位
+    m_silentUs = MicroSeconds(silentUs);
     m_agingPeriods = agingPeriods;
     m_dtUs = dtUs;
     m_sigmaUs = sigmaUs;
 
-    // 接收侧按 T 反馈；发送侧在首个流完成 CNP 初始化后启动 T 定时器。
+    // 接收侧按 T 反馈；发送侧在首个流离开静默期、完成首调后启动定时器。
     if (!m_senderSide && m_periodT > Seconds(0))
         m_periodEvent = Simulator::Schedule(m_periodT, &DciExt::PeriodicTick, this);
     m_sndTickEvent = EventId();
@@ -64,25 +110,29 @@ bool DciExt::IsLongLinkPort(Ptr<NetDevice> dev) const {
     return (qdev != nullptr && qdev->IsWanPort());
 }
 
-// 目标压制比例 r（希望速率变为原来的 r 倍）-> 最小 n 使 M[n] <= r
-uint32_t DciExt::LookupN(double ratio, const DciExtInitCnpState& state) const {
+// 与 dcix 相同的固定压制表：alpha0=0.2，g=1/256，CNP 间隔 4us。
+// 只在构造时生成；控制时按目标速率比例查表，不追踪端侧 alpha 状态。
+void DciExt::BuildTable() {
+    const double g = 1.0 / 256.0;
+    double alpha = 0.2;
+    double multiplier = 1.0;
+    m_M[0] = multiplier;
+    for (uint32_t n = 1; n <= MAX_BURST_N; ++n) {
+        alpha = (1.0 - g) * alpha + g;
+        for (uint32_t k = 0; k < 3; ++k)
+            alpha *= 1.0 - g;
+        multiplier *= 1.0 - alpha / 2.0;
+        m_M[n] = multiplier;
+    }
+}
+
+uint32_t DciExt::LookupN(double ratio) const {
     if (ratio >= 1.0)
         return 0;
-    // n 上限 80：极端 ratio（<0.1）时查表会给到百级连发，端侧刀链每 4us
-    // 消费一次仍会连砍 20+ 刀直接砍崩——保险丝限幅
-    const uint32_t maxN = 80;
-    auto predicted = state;
-    int64_t when = Simulator::Now().GetNanoSeconds();
-    double multiplier = 1;
-    for (uint32_t n = 1; n <= maxN; n++) {
-        RecordCnp(predicted, when);
-        when += m_burstInterval.GetNanoSeconds();
-        AdvanceAlpha(predicted, when);
-        multiplier *= 1 - predicted.alpha / 2;
-        if (multiplier <= ratio)
+    for (uint32_t n = 1; n <= MAX_BURST_N; ++n)
+        if (m_M[n] <= ratio)
             return n;
-    }
-    return maxN;
+    return MAX_BURST_N;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +186,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                             continue;           // 观察/静默期流不受本轮压制
                         if (f.burstRemaining > 0)
                             continue;           // 已有 burst 在发，避免并发
-                        uint32_t n = LookupN(ratio, f.cnp);
+                        uint32_t n = LookupN(ratio);
                         if (n == 0)
                             n = 1;
                         if (m_debug) {
@@ -209,7 +259,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                 }
 
                 if (isNew) {
-                    // 新流：观察 -> CNP初始化 -> T周期查表控制
+                    // 新流：观察 -> 学费 CNP -> 静默 -> T周期查表控制
                     DciExtSndFlow &f = m_sndFlows[key];
                     f.sip = ch.sip;
                     f.dip = ch.dip;
@@ -249,10 +299,11 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         auto inserted = m_rcvFlows.try_emplace(key);
         DciExtRcvFlow &f = inserted.first->second;
         if (inserted.second) {
-            auto saved = m_rcvAckWatermarks.find(key);
-            if (saved != m_rcvAckWatermarks.end()) {
-                f.ackWatermark = saved->second;
-                m_rcvAckWatermarks.erase(saved);
+            auto saved = m_rcvWatermarks.find(key);
+            if (saved != m_rcvWatermarks.end()) {
+                f.ackWatermark = saved->second.ack;
+                f.txWatermark = saved->second.tx;
+                m_rcvWatermarks.erase(saved);
             }
         }
         f.sip = ch.sip;
@@ -269,8 +320,14 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
     // 区别于 ACK 搭载位——后者已在下方剥除）不允许穿透长链路。它一旦到达跨域
     // 发送方会与 0xFA 配额形成双通道压制，并与域内 DCQCN 恢复周期耦合共振
     // （实测：跨域锯齿/82ms 断流/低位均衡）。跨域流拥塞信号唯一通道 = 0xFA 配额。
-    // 本 DC 域内流（host4→host5/6）的 CNP 不经过 SW22，不受影响。
+    // 本 DC 域内流的 CNP 保留，由出口是否为 WAN 区分。
     if (!fromLongLink && ch.l3Prot == 0xFF) {
+        // 只拦截即将跨 WAN 返回源端的 CNP；DCI 也可能转发域内流量。
+        if (m_getOutDevCb.IsNull())
+            return false;
+        Ptr<QbbNetDevice> outDev = m_getOutDevCb(pkt, ch);
+        if (outDev == nullptr || !IsLongLinkPort(outDev))
+            return false;
         if (m_debug) {
             printf("[DCIEXT_CNP_STRIP] %lu node=%u type=FRAME sip=0x%08x dip=0x%08x\n",
                    Simulator::Now().GetTimeStep(), m_nodeId, ch.sip, ch.dip);
@@ -314,9 +371,9 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         auto it = m_rcvFlows.find(key);
         if (it == m_rcvFlows.end()) {
             // 已老化流的迟到 ACK 仅推进保存的水位，不重新激活或补计历史字节。
-            auto saved = m_rcvAckWatermarks.find(key);
-            if (saved != m_rcvAckWatermarks.end() && ch.ack.seq > saved->second)
-                saved->second = ch.ack.seq;
+            auto saved = m_rcvWatermarks.find(key);
+            if (saved != m_rcvWatermarks.end() && ch.ack.seq > saved->second.ack)
+                saved->second.ack = ch.ack.seq;
             return false; // 非活动受管流，原样放行
         }
         DciExtRcvFlow &f = it->second;
@@ -325,23 +382,20 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         // ACK 序号差分累计（乱序期重复 NACK 序号相同 -> 增量 0，自动幂等）
         uint32_t ackSeq = ch.ack.seq;
         if (ackSeq > f.ackWatermark) {
+            if (f.winAckBytes == 0)
+                f.winFirstAckT = Simulator::Now(); // 本窗首个 ACK（首窗归一分母）
             f.winAckBytes += (uint64_t)(ackSeq - f.ackWatermark);
             f.ackWatermark = ackSeq;
 
-            // RTT 采样：ACK.seq = ReceiverNextExpectedSeq（下一个期望字节号），
-            // 确认了所有 seq < ackSeq 的在途包——取 dataArrival 中最后一个
-            // seq < ackSeq 且未消费的项（最近被确认的数据包，含 m_ack_interval
-            // 里程碑多包一 ACK 的情况），其出队->ACK到达差即纯 DC 内 RTT。
-            // 重复 NACK 不越水位不采样，重传重打时间戳，天然幂等。
-            auto ub = f.dataArrival.lower_bound(ackSeq);
-            if (ub != f.dataArrival.begin()) {
-                --ub; // 最后一个 seq < ackSeq 的项 = 本 ACK 新确认的包
-                double rttUs = (double)(Simulator::Now() - ub->second).GetTimeStep() / 1000.0;
+            // PFC 会推迟 ACK；重传会使 ACK 与发送实例的对应关系有歧义。
+            // 按 Karn 原则跳过重传候选，允许真实的短 RTT，无固定 20us 门限。
+            Time rtt;
+            if (f.TakeRttSample(ackSeq, Simulator::Now(), rtt)) {
+                double rttUs = rtt.GetSeconds() * 1e6;
                 f.rttCnt++;
                 f.rttSumUs += rttUs;
                 if (rttUs < f.rttMinUs) f.rttMinUs = rttUs;
                 if (rttUs > f.rttMaxUs) f.rttMaxUs = rttUs;
-                f.dataArrival.erase(f.dataArrival.begin(), std::next(ub)); // 仅清理 seq < ackSeq
             }
         }
     }
@@ -352,7 +406,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
 // 挂钩点 2：出队（SwitchNotifyDequeue）
 //   发送方 DCI：受管流数据包从长链路端口出队时
 //     表A：sndBytes 累计（R_snd 口径 = 实际出长链路的 payload 字节）
-//     流表：OBSERVE -> INIT_CNP -> CTL
+//     流表：OBSERVE -> 学费 CNP -> SILENT -> CTL
 //   接收方 DCI：受管流数据包从 DC 内端口（非长链路）出队时
 //     流表：winTxBytes 累计（txRate 口径）+ dataArrival[seq] 打点
 //     （纯 DC 内 RTT 起点：不含数据在 SW22 深缓冲里的滞留时间）
@@ -400,7 +454,7 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
         // qbbHeader: sport(2) dport(2) flags(2) pg(2) seq(4) → seq 在 L4+8 = base+28
         uint32_t seq = ((uint32_t)buf[base + 28] << 24) | ((uint32_t)buf[base + 29] << 16) |
                        ((uint32_t)buf[base + 30] << 8) | buf[base + 31];
-        f.dataArrival[seq] = now; // 重传覆盖旧时间戳（RTT 归属最新发送）
+        f.RecordTx(seq, payload, now);
         return;
     }
 
@@ -441,12 +495,45 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
                    ((uint32_t)buf[base + 30] << 8) | buf[base + 31];
     f.dataArrival[seq] = now; // 重传覆盖旧时间戳（RTT 归属最新发送）
 
+    // 观察期状态机推进
     if (f.state == DciExtSndFlow::OBSERVE) {
         f.observeBytes += payload;
         if (f.observeBytes >= m_observeBytes) {
+            // 与 dcix 实现一致：两个学费 CNP，间隔 m_burstInterval；
+            // 学费 burst 完成后进入固定静默期，后续按固定表首调。
+            if (m_debug) {
+                printf("[DCIEXT_CNP] %lu node=%u type=TUITION n=2 sip=0x%08x sport=%u dport=%u "
+                       "observe_mib=%.1f\n",
+                       now.GetTimeStep(), m_nodeId, f.sip, f.sport, f.dport,
+                       (double)f.observeBytes / 1048576.0);
+            }
             f.state = DciExtSndFlow::INIT_CNP;
-            InitCnpTick(key);
+            f.burstRemaining = 2;
+            BurstTick(key);
         }
+    } else if (f.state == DciExtSndFlow::SILENT && now >= f.silentUntil) {
+        // 静默期满：比较当前 R_snd 与表A R_avbl，查表首次压制 → 转入受控
+        double dt = (now - e.lastSettle).GetSeconds();
+        double sndRateNow = (e.lastSettle > Seconds(0) && dt > 0)
+                                ? (double)e.sndBytes * 8.0 / dt : e.sndRateBps;
+        f.state = DciExtSndFlow::CTL;
+        if (sndRateNow > e.rAvblBps && sndRateNow > 0 && f.burstRemaining == 0) {
+            double ratio = e.rAvblBps / sndRateNow;
+            uint32_t n = LookupN(ratio);
+            if (n == 0)
+                n = 1;
+            f.burstRemaining = n;
+            if (m_debug) {
+                printf("[DCIEXT_CNP] %lu node=%u type=FIRST_CTL n=%u sport=%u ratio=%.3f\n",
+                       now.GetTimeStep(), m_nodeId, n, f.sport, ratio);
+            }
+            BurstTick(key);
+        }
+
+        // 发送方周期维持任务：以首调时刻为起点，每 T 结算 R_snd 并压制超配
+        //（首个流进入 CTL 时启动一次；后续新流首调不再重复启动）
+        if (m_sndTickEvent.IsExpired() || !m_sndTickEvent.IsRunning())
+            m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
     }
 }
 
@@ -482,7 +569,7 @@ void DciExt::SndTick() {
                         continue;
                     if (f.burstRemaining > 0)
                         continue;
-                    uint32_t n = LookupN(ratio, f.cnp);
+                    uint32_t n = LookupN(ratio);
                     if (n == 0)
                         n = 1;
                     if (m_debug) {
@@ -508,18 +595,16 @@ void DciExt::SndTick() {
 //   2. 聚合 per DIP：N、ackRate（winAckBytes×8/T）、txRate（winTxBytes×8/T，
 //      DCI→DC 出队口径）、纯DC内RTT样本（出队打点 -> ACK 回到差分）
 //   3. RTT 探测状态机（RTT_base = 运行最小值；RTT_t = RTT_base + Dt）：
-//      a. 首次获取 → R_avbl = ACK 速率；|RTT − RTT_t| ≤ σ → R_avbl = ACK 速率
-//         （限制：上一周期若为 CONGESTED，本周期不得立即用 ACK 抬回，保持不变）
+//      a. 首次获取 → R_avbl = 首窗活跃时长归一的 ACK 速率；
+//         |RTT − RTT_t| ≤ σ → R_avbl = max(当前值, ACK 速率)
 //      b. RTT > RTT_t + σ（排队超预期）→ R_avbl = min(ACK 速率, 当前值)，只降不升
 //      c. RTT < RTT_t − σ（队列低于目标）→ 增速：
-//         Wt = (1/D − 1/Dt + W/RTT) × RTT_t，R_avbl = max(当前值, Wt/T)，只升不降
-//         （W=上个T DCI发给DC的字节数，D=RTT−RTT_base；主导项 W/RTT×RTT_t
-//           使 R_avbl ≈ txRate × RTT_t/RTT，即目标延迟比侧速率控制；
-//           1/D、1/Dt 两项分子为 1 字节量级，仅作微调；clamp 到 B）
+//         Wt = (W/RTT) × RTT_t，R_avbl = max(当前值, Wt/T)，只升不降
+//         （W=上个T DCI发给DC的字节数；R_avbl ≈ txRate × RTT_t/RTT，clamp 到 B）
 //   4~5. R_avbl 保持 DIP 级总量语义（分支 a = ACK 总速率，分支 c = 公式结果）。
-//      分配：每流份额 = R_avbl / ceilPow2(N)（N=2 → /2；N=3 → 取 4）；
+//      分配：每流份额 = R_avbl / N（N 为活跃跨域流数，直接除以 N，不再上取 2 的幂）；
 //      表二：每 SenderDC 份额 = 每流份额 × 该DC流数
-//      （例：R_avbl=25.6G，N=3（DC A 2 条 + DC B 1 条）→ A = 25.6/4×2 = 12.8G，B = 25.6/4 = 6.4G）
+//      （例：R_avbl=24G，N=3（DC A 2 条 + DC B 1 条）→ A=16G，B=8G）
 //      （每流下限兜底 1Gbps，防 ACK 断流期反馈 0 配额）
 //   6. 0xFA 发往每组（目的 IP = 该组活跃流的 sip）
 // ---------------------------------------------------------------------------
@@ -530,7 +615,7 @@ void DciExt::PeriodicTick() {
     Time aging = m_agingPeriods * m_periodT;
     for (auto it = m_rcvFlows.begin(); it != m_rcvFlows.end();) {
         if (now - it->second.lastActive > aging) {
-            m_rcvAckWatermarks[it->first] = it->second.ackWatermark;
+            m_rcvWatermarks[it->first] = {it->second.ackWatermark, it->second.txWatermark};
             it = m_rcvFlows.erase(it);
         } else
             ++it;
@@ -541,6 +626,7 @@ void DciExt::PeriodicTick() {
         uint32_t n = 0;
         uint64_t ackBytes = 0;
         uint64_t txBytes = 0;   // 上个T DCI→DC 出队字节（W）
+        Time firstAckT = Seconds(-1); // 本窗各流最早的首个 ACK 时刻
         uint32_t rttCnt = 0;
         double rttSumUs = 0;
         double rttMinUs = 1e18;
@@ -558,6 +644,9 @@ void DciExt::PeriodicTick() {
         a.n++;
         a.ackBytes += f.winAckBytes;
         a.txBytes += f.winTxBytes;
+        if (f.winAckBytes > 0 && f.winFirstAckT >= Seconds(0) &&
+            (a.firstAckT < Seconds(0) || f.winFirstAckT < a.firstAckT))
+            a.firstAckT = f.winFirstAckT;
         if (f.rttCnt > 0) {
             a.rttCnt += f.rttCnt;
             a.rttSumUs += f.rttSumUs;
@@ -568,6 +657,7 @@ void DciExt::PeriodicTick() {
         if (a.senderSip[f.inPort] == 0)
             a.senderSip[f.inPort] = f.sip;
         f.winAckBytes = 0; // 周期清零
+        f.winFirstAckT = Seconds(-1);
         f.winTxBytes = 0;
         f.rttCnt = 0;
         f.rttSumUs = 0;
@@ -586,12 +676,13 @@ void DciExt::PeriodicTick() {
         DciExtRcvDip &rd = m_rcvDips[dip];
 
         // 统计失真防护：ACK 返回速率过低（< 1Gbps，断流/恢复瞬态）时本 T 的
-        // ACK/RTT 统计不可信，R_avbl 与 RTT_base 全部保持不变。
+        // R_avbl 暂时保持；RTT_base 仍可使用可靠的逐包时序样本更新。
         // （PFC 振荡是 DC 内拥塞管理常态，振荡期间 ACK 正常流动、统计可信，不冻结）
         bool stalled = ackRateBps < kDciExtMinRateBps;
 
-        // RTT_base = 运行最小值（首个样本初始化，之后只降不升）
-        if (!stalled && a.rttCnt > 0 && a.rttMinUs < rd.rttBaseUs) {
+        // 仅由无重传歧义的正 RTT 更新运行最小值。PFC 等待只能使样本变大，
+        // 不应按 20us 或 ACK 速率否决真实的短路径/低速样本。
+        if (a.rttCnt > 0 && a.rttMinUs < rd.rttBaseUs) {
             rd.rttBaseUs = a.rttMinUs;
             rd.hasRttBase = true;
         }
@@ -602,7 +693,16 @@ void DciExt::PeriodicTick() {
         } else if (!rd.hasRAvbl) {
             // a. 首次获取 DIP 可用带宽：直接用 ACK 返回速率
             if (ackRateBps > 0) {
-                rd.rAvblBps = ackRateBps; // DIP 级总量：ACK 总速率
+                // 首窗 ACK 只占窗口尾部（数据经 WAN 到达时刻与窗口边界无对齐），
+                // 按"首个 ACK 到达 → 本窗结算"的活跃时长归一，消除窗口相位稀释
+                double activeSec = (a.firstAckT >= Seconds(0))
+                                       ? (now - a.firstAckT).GetSeconds() : tSec;
+                if (activeSec <= 0 || activeSec > tSec)
+                    activeSec = tSec; // 防御：异常时退回整窗口径
+                double firstRateBps = (double)a.ackBytes * 8.0 / activeSec;
+                if (firstRateBps > m_dipBwBps)
+                    firstRateBps = m_dipBwBps; // clamp 到 DIP 带宽上界
+                rd.rAvblBps = firstRateBps; // DIP 级总量：首窗活跃时长归一
                 rd.hasRAvbl = true;
                 branch = "FIRST_ACK";
             } else {
@@ -611,19 +711,9 @@ void DciExt::PeriodicTick() {
         } else if (rd.hasRttBase && a.rttCnt > 0) {
             double rttT = rd.rttBaseUs + m_dtUs;
             if (rttAvgUs >= rttT - m_sigmaUs && rttAvgUs <= rttT + m_sigmaUs) {
-                // a. RTT 在目标区间：ACK 速率即真实可用带宽；但上一周期若为
-                //    CONGESTED（排队超预期），压制刚生效，不得立即用 ACK 抬回
-                //    更新取 max(ACK 速率, 当前值)：区间内 R_avbl 只升不降
-                if (!rd.lastCongested) {
-                    if (ackRateBps > 0) {
-                        rd.rAvblBps = std::max(rd.rAvblBps, ackRateBps);
-                        branch = "STEADY";
-                    } else {
-                        branch = "STEADY_ACK0"; // ACK 断流，保持不变
-                    }
-                } else {
-                    branch = "STEADY_HOLD"; // 上周期过拥：保持不变，防止回弹
-                }
+                // ACK 可能集中返回；确认速率不能把配额抬过实际接入带宽。
+                rd.rAvblBps = std::min(m_dipBwBps, std::max(rd.rAvblBps, ackRateBps));
+                branch = "STEADY";
             } else if (rttAvgUs > rttT + m_sigmaUs) {
                 // b. 排队超预期：R_avbl 只降不升——取 ACK 速率与当前值最小
                 //   （能走到此处 ackRate >= 1Gbps，非 0；压低后由发送方压制兑住）
@@ -631,36 +721,27 @@ void DciExt::PeriodicTick() {
                 branch = "CONGESTED";
             } else {
                 // c. RTT < RTT_t - sigma：队列低于目标，增速探测
-                //   Wt = (1/D − 1/Dt + W/RTT) × RTT_t；R_avbl = Wt/T
+                //   Wt = (W/RTT) × RTT_t（已移除 1/D − 1/Dt 项：该项在 D→0 时
+                //   发散，导致低 RTT 窗口 R_avbl 直冲 B 顶格，跨域流借 PROBE 抢占）
                 if (a.txBytes == 0) {
                     branch = "PROBE_SKIP"; // 本窗无实际发送，W 无数据可判，保持不变
                 } else {
-                double dUs = rttAvgUs - rd.rttBaseUs;
-                if (dUs < 1e-3)
-                    dUs = 1e-3; // 防除零（RTT 恰为历史最小值）
-                double Ds = dUs * 1e-6;           // D（s）
-                double dtS = m_dtUs * 1e-6;        // Dt（s）
-                double RTTs = rttAvgUs * 1e-6;     // 上个T实测RTT（s）
-                double rttTs = rttT * 1e-6;        // RTT_t（s）
-                double W = (double)a.txBytes;      // 上个T DCI→DC 发送量（B）
-                double Wt = (1.0 / Ds - 1.0 / dtS + W / RTTs) * rttTs;
-                double rNewBps = Wt / tSec * 8.0; // Wt 为字节 → ×8 转 bps（与 ackRateBps 口径一致）
-                if (rNewBps > m_dipBwBps)
-                    rNewBps = m_dipBwBps;      // clamp 到 B
-                if (rNewBps < kDciExtMinRateBps)
-                    rNewBps = kDciExtMinRateBps; // 兜底防塌缩
-                rd.rAvblBps = std::max(rd.rAvblBps, rNewBps); // 只升不降
-                branch = "PROBE";
+                    double RTTs = rttAvgUs * 1e-6;     // 上个T实测RTT（s）
+                    double rttTs = rttT * 1e-6;        // RTT_t（s）
+                    double W = (double)a.txBytes;      // 上个T DCI→DC 发送量（B）
+                    double Wt = (W / RTTs) * rttTs;
+                    double rNewBps = Wt / tSec * 8.0; // Wt 为字节 → ×8 转 bps（与 ackRateBps 口径一致）
+                    if (rNewBps > m_dipBwBps)
+                        rNewBps = m_dipBwBps;      // clamp 到 B
+                    if (rNewBps < kDciExtMinRateBps)
+                        rNewBps = kDciExtMinRateBps; // 兜底防塌缩
+                    rd.rAvblBps = std::max(rd.rAvblBps, rNewBps); // 只升不降
+                    branch = "PROBE";
                 }
             }
         } else {
             branch = "NO_SAMPLE"; // 尚无 RTT 样本：保持不变
         }
-
-        // 记录本周期分支，供下周期 STEADY 的回弹限制使用
-        // （STALL_HOLD 的 RTT 统计不可信，保持原值不更新）
-        if (branch != "STALL_HOLD")
-            rd.lastCongested = (branch == "CONGESTED");
 
         if (m_debug) {
             printf("[DCIEXT_STATS] %lu node=%u dip=0x%08x N=%u txRate=%.3fG ackRate=%.3fG "
@@ -678,19 +759,14 @@ void DciExt::PeriodicTick() {
 
         if (!rd.hasRAvbl) continue; // 尚无有效参考，不发送占位配额
 
-        // 4. 分配：移位除法，N 上取 2 的幂 P，每流份额 = R_avbl >> log2(P)
-        uint32_t p = 1, shift = 0;
-        while (p < a.n) {
-            p <<= 1;
-            shift++;
-        }
-        uint64_t perFlow = (uint64_t)rd.rAvblBps >> shift;
+        // 4. 每流份额 = R_avbl / N，N 为活跃跨域流数。
+        uint64_t perFlow = (a.n > 0) ? (uint64_t)(rd.rAvblBps / a.n) : 0;
         // 每流配额至少为 1Gbps，为 ACK 断流/恢复阶段保留非零反馈配额。
         if (perFlow < kDciExtMinRateBps)
             perFlow = kDciExtMinRateBps;
 
         for (auto &sc : a.senderCounts) {
-            // 5. 表二：每 SenderDC 分得 (R_avbl/ceilPow2(N)) × 该DC流数
+            // 5. 表二：每 SenderDC 分得 (R_avbl/N) × 该DC流数
             double rAvblBps = (double)perFlow * sc.second;
             uint32_t dstIp = a.senderSip[sc.first];
             if (m_debug) {
@@ -745,10 +821,8 @@ void DciExt::SendCnpForFlow(const DciExtFlowKey &key) {
 
     CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
     newp->PeekHeader(ch);
-    if (!m_sendCb.IsNull()) {
-        RecordCnp(f.cnp, Simulator::Now().GetNanoSeconds());
+    if (!m_sendCb.IsNull())
         m_sendCb(newp, ch);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,79 +863,23 @@ void DciExt::SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps) {
         m_sendCb(newp, ch);
 }
 
-// 原生参数与已有查表一致：g=1/256，alpha更新1us，降速消费4us。
-void DciExt::AdvanceAlpha(DciExtInitCnpState &state, int64_t nowNs) {
-    if (!state.initialized || nowNs < state.nextAlphaNs)
-        return;
-    int64_t slots = (nowNs - state.nextAlphaNs) / 1000 + 1;
-    state.alpha *= std::pow(255.0 / 256.0, slots);
-    if (state.pending)
-        state.alpha += std::pow(255.0 / 256.0, slots - 1) / 256.0;
-    state.pending = false;
-    state.nextAlphaNs += slots * 1000;
-}
-
-void DciExt::RecordCnp(DciExtInitCnpState &state, int64_t nowNs) {
-    if (!state.initialized) {
-        state.initialized = true;
-        state.pending = false;
-        state.alpha = 1; // 首个 CNP 的原生行为
-        state.nextAlphaNs = nowNs + 1000;
-    } else {
-        AdvanceAlpha(state, nowNs);
-        state.pending = true;
-    }
-}
-
-void DciExt::InitCnpTick(DciExtFlowKey key) {
-    auto it = m_sndFlows.find(key);
-    if (it == m_sndFlows.end() || it->second.state != DciExtSndFlow::INIT_CNP)
-        return;
-    DciExtSndFlow &f = it->second;
-    SendCnpForFlow(key);
-    NS_ABORT_MSG_IF(!f.cnp.initialized, "CNP initialization requires a send callback");
-    auto after = f.cnp;
-    AdvanceAlpha(after, after.nextAlphaNs);
-    if (std::abs(after.alpha - 0.2) <= 0.002) {
-        f.state = DciExtSndFlow::CTL;
-        if (m_debug) {
-            printf("[DCIEXT_FLOW_CTL] %lu node=%u sport=%u alpha_model=%.6f\n",
-                   Simulator::Now().GetTimeStep(), m_nodeId, f.sport, after.alpha);
-        }
-        if (!m_sndTickEvent.IsRunning()) {
-            // 首轮沿用启动阶段已累计的测量；不再等待一个额外 T。
-            m_sndTickEvent = Simulator::Schedule(m_burstInterval, &DciExt::SndTick, this);
-        }
-        return; // 初始化完成，无额外静默/观察阶段
-    }
-    // 高alpha稀疏发包，靠原生衰减下降；低alpha每2us补一个CNP上升。
-    // 最大间隔取原生alpha时间常数的1/4（256us/4），不是新的静默参数。
-    int64_t delayNs = after.alpha < 0.2 ? 2000 : 64000;
-    if (after.alpha > 0.2) {
-        for (int64_t gap = 1000; gap <= 64000; gap += 1000) {
-            auto candidate = f.cnp;
-            RecordCnp(candidate, Simulator::Now().GetNanoSeconds() + gap);
-            AdvanceAlpha(candidate, candidate.nextAlphaNs);
-            if (candidate.alpha <= 0.202) {
-                delayNs = gap;
-                break;
-            }
-        }
-    }
-    f.burstEvent = Simulator::Schedule(NanoSeconds(delayNs), &DciExt::InitCnpTick, this, key);
-}
-
 void DciExt::BurstTick(DciExtFlowKey key) {
     auto it = m_sndFlows.find(key);
     if (it == m_sndFlows.end())
         return;
     DciExtSndFlow &f = it->second;
-    if (f.state != DciExtSndFlow::CTL || f.burstRemaining == 0)
+    if ((f.state != DciExtSndFlow::INIT_CNP && f.state != DciExtSndFlow::CTL) ||
+        f.burstRemaining == 0)
         return;
     SendCnpForFlow(key);
     if (--f.burstRemaining > 0)
         f.burstEvent = Simulator::Schedule(m_burstInterval, &DciExt::BurstTick, this, key);
     else {
+        // burst 结束：学费 burst → 转静默；重置 DIP 结算基准
+        if (f.state == DciExtSndFlow::INIT_CNP) {
+            f.state = DciExtSndFlow::SILENT;
+            f.silentUntil = Simulator::Now() + m_silentUs;
+        }
         auto dit = m_sndDips.find(f.dip);
         if (dit != m_sndDips.end()) {
             dit->second.sndBytes = 0;

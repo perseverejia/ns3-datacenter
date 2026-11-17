@@ -20,11 +20,11 @@ CrossDC-Algos/
 │       ├── config-micro.txt
 │       ├── Alistorage.txt
 │       └── websearch.txt
-├── results/                # 仿真结果（运行时生成）
-│   ├── dump/               # 日志文件
-│   ├── fct/                # FCT 数据
-│   └── pfc/                # PFC 数据
-├── plots/                  # 画图结果（运行时生成）
+├── results/                # 运行时临时数据，当前已清空
+├── plots/                  # 最终四场景、五算法对比图
+│   ├── tx-rate.{png,pdf}
+│   ├── queue-length.{png,pdf}
+│   └── fct.{png,pdf}
 ├── scripts/                # 运行脚本
 │   ├── run_single_workload_algo.py
 │   └── run_all_algos.sh
@@ -80,6 +80,7 @@ CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
 ```
 
 主程序和运行脚本都默认使用 `config-micro.txt`，默认查询流为 `query-flow-2-2.txt`。
+micro 与 workload 的参数一致，保留现有 micro 拓扑和默认输入；各场景通过覆盖查询流路径切换。
 
 ### 2. 运行仿真
 
@@ -116,10 +117,26 @@ python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
 
 ### 3. 查看结果
 
+最终对比图仅保留以下六个文件，历史实验及原始数据已清理：
+
+| 指标 | PNG | PDF |
+| --- | --- | --- |
+| TX rate | [tx-rate.png](plots/tx-rate.png) | [tx-rate.pdf](plots/tx-rate.pdf) |
+| 普通 DC 队列长度 | [queue-length.png](plots/queue-length.png) | [queue-length.pdf](plots/queue-length.pdf) |
+| FCT | [fct.png](plots/fct.png) | [fct.pdf](plots/fct.pdf) |
+
+五算法依次为 DCQCN、GRC、ATC、THEMIS、DCIExt；四场景为 1-1、1-2、2-1、2-2。
+每组运行五次，固定 `randomSeed=7`、`RngSeed=1`，使用 `RngRun=1..5`。
+TX/队列图展示第 1 次运行，FCT 展示五次运行的均值、各次结果和最小–最大范围。
+TX 使用现有 `ns3::RdmaHw::TxRateSampleInterval=10` 属性采样，再计算 100µs 滑动窗、10µs 步长；
+队列为每 40µs 采样的非 DCI 最大出口队列，单位为十进制 MB。FCT 不扣除跨域 RTT。
+
+重新运行单算法脚本时，临时结果仍按以下路径生成：
+
 - **日志文件**：`results/dump/algo_cc{ccMode}_load{load}.log`
 - **数据文件**：`results/fct/`, `results/pfc/`
 - **瓶颈队列文件**：默认位于 `results/bottleneck_queue_length/`，可通过已有的 `BOTTLENECK_MON_FILE` 配置指定。
-- **图片文件**：`plots/workload_{algo}_cc{ccMode}_load{load}.png`
+- **图片文件**：`results/plots/workload_{algo}_cc{ccMode}_load{load}.png`
 
 四个场景都使用 `config-micro.txt`。输出沿用原来的命名和目录，
 同算法、同负载切换查询流后会覆盖同名结果；比较场景前先保存上一场景的结果。
@@ -136,7 +153,7 @@ python3 examples/CrossDC-Algos/scripts/run_single_workload_algo.py 16 DCIEXT \
 
 ### TX Rate 图
 
-独立的发送端速率图，显示每个 query flow 的发送速率变化，保存在 `plots/workload_txrate_{algo}_cc{ccMode}_load{load}.png`。
+独立的发送端速率图，显示每个 query flow 的发送速率变化，保存在 `results/txrate/workload_txrate_{algo}_cc{ccMode}_load{load}.png`。
 
 ### 统计数据
 
@@ -185,11 +202,8 @@ CrossDC-Algos/
 │   ├── topology/               ✅ 拓扑文件
 │   ├── query-flow/             ✅ query-flow 文件
 │   └── workload/               ✅ 配置文件
-├── results/                    ✅ 仿真结果
-│   ├── dump/
-│   ├── fct/
-│   └── pfc/
-├── plots/                      ✅ 图片输出
+├── results/                    ✅ 临时数据（当前已清空）
+├── plots/                      ✅ 最终 PNG/PDF 对比图
 ├── scripts/
 │   ├── run_single_workload_algo.py  ✅ 单算法运行脚本
 │   └── run_all_algos.sh        ✅ 批量运行脚本
@@ -218,11 +232,23 @@ CrossDC-Algos/
 
 ATC 和 DCI-Ext 的发送侧固定为 SW21/SW23，接收侧固定为 SW22，
 没有查询流的源 DC 保持空闲，无需切换部署节点。
-DCI-Ext 的新流观察期为 `DCIEXT_OBSERVE_MB 10`，收发双方共用周期 `DCIEXT_T_US 400`。
-DCI-Ext 的带宽基准 B 自动取拓扑中的服务器接入带宽（假设所有接入链路速率一致），
-发送侧新 DIP 的初始配额为 B/4，接收侧 PROBE 候选速率上界为 B。
-接收侧 DIP 总 ACK 速率低于 1 Gbps 时保持估计不变；PROBE 候选速率下界和
-分配后的每流配额下界也固定为 1 Gbps。
+micro 与 workload 两份配置的参数一致，保留默认输入、拓扑接入带宽自动推导和固定 1 Gbps 低速门限；
+DCQCN 与 DCI-Ext 使用已确认的 `dcix-ack-rework` 实验参数。SW16–SW20 固定为
+100 Gbps、RTT/BDP 窗口只计算往返传播时延（不加包串行化时间）。`NIC_DELAY` 为
+15 μs，入口 PFC 池为 9 MiB、alpha 为 0.125。
+
+DCI-Ext 的新流观察期为 `DCIEXT_OBSERVE_MB 20`（20 MiB，20,971,520 B）。
+收发双方共用周期 `DCIEXT_T_US 400`，用于接收方反馈和发送方周期压制。
+达到观察量后发两个学费 CNP，再进入 `DCIEXT_SILENT_US 400` 静默阶段。
+离开静默期后直接查固定压制表：alpha0=0.2、g=1/256、CNP 间隔 4 μs，
+表在构造时生成，普通压制最多 80 个 CNP，不维护 alpha 追踪状态或初值配置。
+RTT 样本不使用固定 20 μs 下限；重传歧义样本被排除，发送水位跨流老化保留。
+
+带宽基准 B 使用拓扑解析得到的服务器接入速率 `nic_rate`（当前为 40 Gbps，假设所有接入链路速率一致），无需单独配置。
+发送侧新 DIP 的初始配额为 B/4，
+接收侧 PROBE 候选速率上界为 B。总 ACK 速率低于 1 Gbps 时保持配额估计；
+PROBE 候选速率下界和每流配额下界也固定为 1 Gbps。
+RTT 目标与容差分别为 `DCIEXT_DT_US 10`、`DCIEXT_SIGMA_US 6`，流老化为 4 个反馈周期。
 
 查询流文件首行是流数量，后续各行格式为：
 

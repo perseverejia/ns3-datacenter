@@ -17,6 +17,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def parse_dcqcn_queue_record(line):
+    """Return a complete numeric queue record; skip concatenated or truncated lines."""
+    match = re.fullmatch(r"\[DCQCN_QLEN\]\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", line.strip())
+    if match is None:
+        return None
+    stamp, switch, port, size = map(int, match.groups())
+    return switch, port, stamp / 1e6, size / 1000.0
+
+
 def analyze_query_flow_fct(query_fct_file):
     """Analyze query flow FCT and print statistics."""
     if not os.path.exists(query_fct_file):
@@ -99,7 +108,8 @@ DUMP_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results/dump")
 RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
 PFC_DIR = os.path.join(RESULTS_DIR, "pfc")
-PLOTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "plots")
+TXRATE_DIR = os.path.join(RESULTS_DIR, "txrate")
+PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
 ANALYSIS_DIR = os.path.join(RESULTS_DIR, "analysis")
 ATC_ALGO_MODE = 15
 
@@ -563,12 +573,9 @@ def run_and_plot(args):
 
             if "[DCQCN_QLEN]" in line and args.ccMode in (1, 3, 7, 15, 16, 17, 18, 19):
                 # ccMode=15 (ATC) / ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
-                parts = line.split()
-                if len(parts) >= 5:
-                    sw = int(parts[2])
-                    port = int(parts[3])
-                    t_ms = float(parts[1]) / 1e9 * 1000
-                    q_kb = float(parts[4]) / 1000.0
+                record = parse_dcqcn_queue_record(line)
+                if record is not None:
+                    sw, port, t_ms, q_kb = record
                     all_queue_data.setdefault((sw, port), {"times": [], "queues": []})
                     all_queue_data[(sw, port)]["times"].append(t_ms)
                     all_queue_data[(sw, port)]["queues"].append(q_kb)
@@ -684,8 +691,9 @@ def run_and_plot(args):
         topo_for_map = args.topology or read_config_value(content, "TOPOLOGY_FILE", "")
         port_map, topo_adj = parse_topology_adjacency(topo_for_map)
         pfc_by_flow = map_pfc_events_to_flows(pfc_events, port_map, topo_adj, sorted(tx_rates))
+        os.makedirs(TXRATE_DIR, exist_ok=True)
         tx_rate_output_file = os.path.join(
-            PLOTS_DIR,
+            TXRATE_DIR,
             f"workload_txrate_{args.algo_name.lower()}_cc{args.ccMode}_load{load_tag(load)}.png",
         )
         if tx_rates:

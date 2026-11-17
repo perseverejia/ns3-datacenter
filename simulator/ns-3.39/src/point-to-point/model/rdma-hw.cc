@@ -24,6 +24,7 @@
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("RdmaHw");
+NS_OBJECT_ENSURE_REGISTERED(RdmaHw);
 
 TypeId RdmaHw::GetTypeId (void)
 {
@@ -917,7 +918,7 @@ void RdmaHw::SampleTxRate(Ptr<RdmaQueuePair> qp) {
 	// stdio stream, so each printf call is serialized instead of being
 	// interleaved after the runner redirects stdout and stderr to one file.
 	#if TX_RATE_LOG
-	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps rt %.0fbps t %luns\n",
+	printf("[TX RATE] Host %u sip %u dip %u sport %u dport %u pg %u txRate %.0fbps rt %.0fbps t %lluns\n",
 	        m_node->GetId(),
 	        qp->sip.Get(), qp->dip.Get(),
 	        qp->sport, qp->dport, qp->m_pg,
@@ -1688,7 +1689,7 @@ void RdmaHw::HandleFrpFeedback(Ptr<RdmaQueuePair> qp, uint16_t fairRate, int16_t
 	// 输出FRP接收日志：记录瓶颈节点ID、链路速率、公平速率
 	static uint32_t recvCounter = 0;
 	if (recvCounter++ < 500) {  // 扩大到500条，能看到跨DC流完整生命周期
-		fprintf(stderr, "[FRP_RECV_DETAIL] t=%.3fms Host=%u flow=%u->%u cpId=%u linkRate=%u*10Mbps(%.2fGbps) fairRate=%u*10Mbps(%.2fGbps) qDev=%dcells(%.2fKB) type=%d\n",
+		printf("[FRP_RECV_DETAIL] t=%.3fms Host=%u flow=%u->%u cpId=%u linkRate=%u*10Mbps(%.2fGbps) fairRate=%u*10Mbps(%.2fGbps) qDev=%dcells(%.2fKB) type=%d\n",
 			Simulator::Now().GetSeconds() * 1000.0,
 			m_node->GetId(),
 			qp->sip.Get(), qp->dip.Get(),
@@ -1814,8 +1815,8 @@ void RdmaHw::HandleFrpFeedback(Ptr<RdmaQueuePair> qp, uint16_t fairRate, int16_t
 		          << std::endl;
 	}
 
-	// 调试输出（使用stderr确保无缓冲）
-	fprintf(stderr, "[FRP RATE] Host %u qp=%u->%u F=%.2fG qDev=%dcells(%.2fKB) type=%d backoff=%d srcDc=%u dstDc=%u curRate=%.2fG r=%.2fG %s\n",
+	// 运行日志与队列/TX RATE 共用 stdout，保证合流后的记录完整。
+	printf("[FRP RATE] Host %u qp=%u->%u F=%.2fG qDev=%dcells(%.2fKB) type=%d backoff=%d srcDc=%u dstDc=%u curRate=%.2fG r=%.2fG %s\n",
 		m_node->GetId(),
 		qp->sip.Get(), qp->dip.Get(),
 		fairRateBps/1e9,

@@ -167,6 +167,8 @@ Ptr<ThemisGateway> SwitchNode::InitializeThemis(uint32_t dc,
 }
 
 void SwitchNode::DoDispose() {
+	m_dciExtEnabled = false;
+	m_dciExt.Dispose();
 	if (m_themis) {
 		m_themis->Dispose();
 		m_themis = nullptr;
@@ -773,10 +775,10 @@ Ptr<Packet> SwitchNode::ConfigureFeedbackPayload(uint32_t ccMode,
     Ptr<Packet> payload = Create<Packet>();
     Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
     
-    // 调试日志：输出ccMode
+    // 运行日志与队列日志共用 stdout，避免合并 stdout/stderr 时拆开一条记录。
     static bool logged = false;
     if (!logged && (ccMode == 13 || ccMode == 14)) {
-        fprintf(stderr, "[SWITCH_DEBUG] Switch %u ConfigureFeedbackPayload ccMode=%u ifIndex=%u\n", m_id, ccMode, ifIndex);
+        printf("[SWITCH_DEBUG] Switch %u ConfigureFeedbackPayload ccMode=%u ifIndex=%u\n", m_id, ccMode, ifIndex);
         logged = true;
     }
     
@@ -1002,7 +1004,7 @@ void SwitchNode::StartBifrostPfcMechanism() {
     if (!m_bifrostEnabled) {
         return;
     }
-    fprintf(stderr, "[BIFROST] Switch %u starting periodic PFC mechanism, period=%uus\n",
+    printf("[BIFROST] Switch %u starting periodic PFC mechanism, period=%uus\n",
             m_id, m_bifrostPfcPeriodUs);
     m_bifrostLastPfcTimeUs = Simulator::Now().GetMicroSeconds();
     m_bifrostPfcEvent = Simulator::Schedule(
@@ -1046,7 +1048,7 @@ void SwitchNode::SendBifrostPfcWithCustomTime() {
             // 发送带自定义暂停时间的PFC
             dev->SendPfcWithTime(qIndex, 0, customTime);
 
-            fprintf(stderr, "[BIFROST_PFC] t=%.3fus Sw=%u inDev=%u qIdx=%u "
+            printf("[BIFROST_PFC] t=%.3fus Sw=%u inDev=%u qIdx=%u "
                     "qLen=%uB r=%uBytes pauseTime=%uus\n",
                     (double)now, m_id, inDev, qIndex,
                     qLenBytes, r, customTime);
@@ -1215,23 +1217,23 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
 
 // ============================================================================
 // DCI-Ext (ccMode=16): DCI 交换机初始化
-//   发送侧（senderSide=true）：DIP 预算 + 观察/CNP初始化/周期查表
+//   发送侧（senderSide=true）：DIP 预算 + 观察/学费CNP/静默/周期查表
 //                               + ECN 快速反馈 + 0xFA 反馈消费
 //   接收侧（senderSide=false）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 // ============================================================================
 void SwitchNode::InitializeDciExt(uint32_t nodeId, uint32_t burstIntervalUs, double periodTUs,
-                                   uint64_t dipBwBps, uint64_t observeMb,
+                                   uint64_t dipBwBps, uint64_t observeMb, uint32_t silentUs,
                                    uint32_t agingPeriods, bool senderSide,
                                    double dtUs, double sigmaUs) {
     m_dciExtEnabled = true;
     m_dciExt.SetSenderSide(senderSide);
     m_dciExt.Configure(nodeId, burstIntervalUs, periodTUs, dipBwBps,
-                       observeMb, agingPeriods, dtUs, sigmaUs);
+                       observeMb, silentUs, agingPeriods, dtUs, sigmaUs);
     std::cout << "[DCIEXT] Initialized DCI-Ext v3 on switch " << GetId()
               << (senderSide ? " (SENDER: 表A+观察期+ECN反馈+0xFA消费)"
                              : " (RECEIVER: RTT探测+周期0xFA反馈)")
               << " (T=" << periodTUs << "us, dipBw=" << dipBwBps / 1e9 << "G"
-              << ", observe=" << observeMb << "MB"
+              << ", observe=" << observeMb << "MiB, silent=" << silentUs << "us"
               << ", aging=" << agingPeriods << "T"
               << ", Dt=" << dtUs << "us, sigma=" << sigmaUs << "us)" << std::endl;
 }
