@@ -1,7 +1,9 @@
 #ifndef __ATC_GATEWAY_H__
 #define __ATC_GATEWAY_H__
 
+#include <deque>
 #include <map>
+#include <tuple>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -57,6 +59,15 @@ struct VoqEntry {
     EventId voqReleaseEvent;             // VOQ释放定时器
     Time lastTransmitTime;             // 最后转发时间
 
+    // This VOQ already identifies the destination. Each QP has its own
+    // cumulative ACK sequence and its own go-back-N recovery position.
+    struct Flight {
+        uint32_t nextSeq = 0;
+        uint32_t acknowledged = 0;
+        std::deque<std::pair<uint32_t, uint32_t>> outstanding; // payload end, wire bytes
+    };
+    using FlowKey = std::tuple<uint32_t, uint16_t, uint16_t, uint16_t>; // source IP, ports, PG
+    std::map<FlowKey, Flight> flights;
     uint64_t currentInflightBytes; // 当前在飞行中的字节数（字节）
     uint64_t maxInflightBytes; // 最大飞行字节数（字节）
 
@@ -124,6 +135,7 @@ struct LongHaulFeedbackPeer {
     CustomHeader routeHeader;
     uint64_t remoteForwardedBytes = 0;
     uint32_t nodeId = 0;
+    Ptr<QbbNetDevice> wanDevice;
 };
 
 
@@ -135,7 +147,6 @@ public:
     int m_gatewayType; // 0普通节点 ，1 发送端门廊，2 接收到门廊
     bool m_congested; // 是否拥塞
     uint8_t m_ecnbits; // 报文 ECN 位
-    uint32_t m_packet_size; // 报文净荷大小
     uint32_t m_voqMaxSize; // 每个VOQ最大大小（字节）
     Time m_cnpNotifyInterval; // source gateway CNP限频间隔
     bool m_cnpOnGlobalCongestion; // 是否允许source gateway全局拥塞状态触发CNP
@@ -143,6 +154,8 @@ public:
     Time m_voqInflightRtt; // destination VOQ下游在途窗口使用的RTT估计
     uint64_t m_cnpByGlobalCongestion;
     uint64_t m_cnpByPacketEcn;
+    uint64_t m_voqBypassPackets = 0;
+    uint64_t m_voqBypassBytes = 0;
     uint64_t m_diagLongHaulFeedbackRecv;
     uint64_t m_diagLongHaulFeedbackSent;
     uint64_t m_diagLongHaulOverInflight;
@@ -166,6 +179,7 @@ public:
 
     // 长距离控制
     LongHaulState longHaulState;
+    std::map<uint32_t, LongHaulState> sourceWanStates;
     std::map<uint32_t, LongHaulFeedbackPeer> longHaulFeedbackPeers;
     EventId longHaulFeedbackEvent;
 
@@ -222,7 +236,7 @@ public:
     uint16_t EtherToPpp (uint16_t proto);
 
     // ========== VOQ管理函数 ==========
-    uint32_t AllocateVoq(Ipv4Address destIp);
+    int32_t AllocateVoq(Ipv4Address destIp);
     void ReleaseVoq(uint32_t voqId);
     void CheckVoqRelease(uint32_t voqId);
     Time CalculateTransmitTime(uint32_t pktSize, DataRate rate);
@@ -243,9 +257,10 @@ public:
 
     // 初始化长距离状态
     void InitLongHaulState(uint64_t longHaulBandwidth,Time longHaulDelay);
+    void ConfigureSourceWanPort(uint32_t port, uint64_t bandwidth, Time delay);
     void RegisterLongHaulPeer(uint32_t ingressIfIndex, uint32_t nodeId,
-                              const CustomHeader& ch);
-    void RecordRemoteForwarded(Ptr<const Packet> packet);
+                              const CustomHeader& ch, Ptr<QbbNetDevice> device = nullptr);
+    void RecordDataDequeue(Ptr<QbbNetDevice> egress, Ptr<const Packet> packet);
     // 启动长距离反馈定时器
     void StartLongHaulFeedbackTimer();
      // 生成长距离反馈

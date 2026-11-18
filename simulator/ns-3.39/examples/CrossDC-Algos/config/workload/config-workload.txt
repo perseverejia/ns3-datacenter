@@ -1,5 +1,5 @@
 # ================================================================================
-# CrossDC-Algos 配置文件
+# CrossDC-Algos 3DC × 128 服务器 workload 配置
 # 按算法分组配置，便于管理和对比实验
 # ================================================================================
 
@@ -12,27 +12,27 @@ ENABLE_TRACE 1
 NIC_DELAY 15000
 
 # ===== 拓扑和流量文件 =====
-# 修改这里即可切换拓扑和查询流文件（无需改代码）
-TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-micro.txt
-QUERY_FLOW_FILE examples/CrossDC-Algos/config/query-flow/query-flow-2-2.txt
+# QUERY_FLOW_FILE 可指定固定前景流，省略时按下方 FILE_* 参数生成。
+TOPOLOGY_FILE examples/CrossDC-Algos/config/topology/topology-3dc128.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix.tr
 
 # ===== 输出文件模板 =====
 FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/fct_{suffix}.txt
 PFC_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/pfc/pfc_{suffix}.txt
-QUERY_FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/query-flow-{suffix}.txt
+FILE_FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/file-flow-{suffix}.txt
 
 # ===== Workload 参数 =====
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
-LOAD 0
-LOAD_DC1 0
+LOAD 0.3
 START_TIME 0
 FLOW_LAUNCH_END_TIME 0.1
-QUERY_REQUEST_RATE 0
-REQUEST_SIZE 0
-INCAST 5
-QUERY_AUTO_STOP 1
+# A/C → B，32 条前景流在 5–100 ms 内按 incast 分组启动
+FILE_FLOW_COUNT 32
+FILE_FLOW_SIZE_BYTES 300000000
+FILE_INCAST 4
+FILE_FLOW_START_TIME 0.005
+FILE_AUTO_STOP 0
 
 # ===== 混合流量模式 =====
 # 背景流已改为根据 CDF 自动生成，不再从文件加载
@@ -60,7 +60,7 @@ MIN_RATE 100Mb/s
 # [Bifrost] ccMode=12 - Bifrost 周期性 PFC 机制
 # 仅在 DCI 交换机上启用，其他交换机回退到 DCQCN
 # ================================================================================
-BIFROST_DEPLOY_SWITCH 22
+BIFROST_DEPLOY_SWITCH 403
 BIFROST_PFC_PERIOD 100
 
 # ================================================================================
@@ -79,12 +79,12 @@ BIFROST_PFC_PERIOD 100
 # 基于 DCQCN 端侧调速，在 DCI 交换机启用 gateway
 # ================================================================================
 GATEWAY_TYPE 0
-# 发送侧 DCI 网关（multiDC 中继拓扑：长链路 21↔22、22↔23 的发送端 SW21/SW23）
-GATEWAY_SRC 2 21 23
-GATEWAY_DST 1 22
+# 每 DC 一台独立 DCI：DC0/DC2 为发送侧，DC1 为接收侧
+GATEWAY_SRC 2 402 404
+GATEWAY_DST 1 403
 MAX_ATC_VOQ_COUNT 128
 MAX_ATC_VOQ_RATE 100000000000
-ATC_VOQ_MAX_SIZE 1000000
+ATC_VOQ_MAX_SIZE 4000000
 ATC_CNP_NOTIFY_INTERVAL 50
 ATC_MIN_RATE 100Mb/s
 ATC_RATE_DECREASE_INTERVAL 100
@@ -95,9 +95,9 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(20MiB→两个学费CNP→400us静默→查表)
+# 发送方 DCI（SW402、SW404）：表A DIP速度表 + 流观察期(10MiB→两个学费CNP→400us静默→查表)
 #                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 消费/查表连发
-# 接收方 DCI（节点 22）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
+# 接收方 DCI（SW403）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # ================================================================================
 # 普通控制的 CNP 连发间隔（us）
 DCIEXT_BURST_INTERVAL_US 4
@@ -108,18 +108,18 @@ DCIEXT_DT_US 10
 # RTT 目标区间容差 sigma（us）：区间内取当前配额与 ACK 速率的较大值
 DCIEXT_SIGMA_US 6
 # 新流观察期（MiB，1 MiB = 1,048,576 B）：达到阈值后发两个学费 CNP，再静默 400us
-DCIEXT_OBSERVE_MB 20
+DCIEXT_OBSERVE_MB 10
 DCIEXT_SILENT_US 400
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
-# 发送方 DCI 交换机列表（multiDC 中继拓扑：SW21、SW23 = 两条长链路发送端，表A+观察期+ECN反馈+0xFA消费）
-DCIEXT_SENDER_TAX_NODES 2 21 23
+# 发送方 DCI 交换机列表（DC0/DC2 的独立 DCI）
+DCIEXT_SENDER_TAX_NODES 2 402 404
 
 # ================================================================================
 # [ePFC] ccMode=17 - extended PFC：PFC 的流级扩展（所有交换机打标 + 边缘执行）
 # 打标：入口超 PFC 动态门限×百分比 且 出口超阈值；或接收方 DCI 出口超阈值
 # 边缘：CCF 出端口对端是 host 或接收方 DCI；超额判据用内部 RTT
-# 接收方 DCI 列表：个数 + 节点 ID（micro 为 SW22）
+# 接收方 DCI 列表：个数 + 节点 ID（DC1 的独立 DCI）
 # ================================================================================
 EPFC_INGRESS_MUL_PCT 50
 EPFC_EGRESS_THRESH_KB 256
@@ -127,8 +127,8 @@ EPFC_DCI_TH_KB 256
 EPFC_RTT_INTERNAL_US 30
 EPFC_AGING_RTTS 2
 EPFC_UPDATE_T_US 1000
-EPFC_RX_DCI_NODES 1 22
-# 固定 rv 测试（Gbps，0=正常采样驱动）：>0 时 SW22 表 rv 钉死该值，
+EPFC_RX_DCI_NODES 1 403
+# 固定 rv 测试（Gbps，0=正常采样驱动）：>0 时接收侧 DCI 表 rv 钉死该值，
 # 窗内 MIN 棘轮旁路，CCF 双向改写为该值——隔离 rv 塌缩变量，单检门控执行层
 EPFC_FIXED_RV_G 20
 
@@ -212,6 +212,5 @@ QLEN_MON_START 0
 QLEN_MON_END 2000000000
 # 指定监控队列长度的交换机 ID 列表（空格分隔）
 # 如果不指定或为空，则监控所有交换机
-# testbed 拓扑: 4 5 6 7
-# topology.txt: 根据实际需要指定
-QLEN_MON_SWITCHES 14 19 22
+# 监控 DC1 的接收 ToR、两台 Spine 和独立 DCI
+QLEN_MON_SWITCHES 388 398 399 403

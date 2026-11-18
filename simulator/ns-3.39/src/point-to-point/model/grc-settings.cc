@@ -76,7 +76,7 @@ GrcLog::Open(const std::string& dir)
                           "time_ns,node,src_as,dst_as,epoch_send_Bps,ref_before_Bps,ref_after_Bps,"
                           "rtt_samples,epoch_rtt_ns,sensitive_rtt_ns,base_rtt_ns,queue_delay_ns,"
                           "w,k,nhat,packet_count,cnp_count,start_bytes,end_bytes,cur_bytes,state,"
-                          "consecutive_epochs\n");
+                          "consecutive_epochs,min_sample_rtt_ns\n");
     }
 }
 

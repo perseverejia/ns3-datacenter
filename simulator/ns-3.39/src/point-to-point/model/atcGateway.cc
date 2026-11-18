@@ -21,7 +21,6 @@ atcGateway::atcGateway()
     m_gatewayType = 0;
     m_congested = false;
     m_ecnbits = 0;
-    m_packet_size = 0; // 报文净荷大小
     m_voqMaxSize = VOQ_MAX_SIZE;
     m_cnpNotifyInterval = CNP_NOTIFY_INTERVAL;
     m_cnpOnGlobalCongestion = true;
@@ -112,11 +111,11 @@ void atcGateway::PrintAtcDebugSummary(const char* reason)
         }
     }
 
-    printf("+++atcGateway diag reason:%s gatewayType:%d activeVoqs:%u enqBytes:%lu sentBytes:%lu blockedInflight:%lu ack:%lu cnpAck:%lu ackDeducted:%lu maxQueueBytes:%lu maxQueuePkts:%lu maxVoqInflight:%lu lhRecv:%lu lhSent:%lu lhOver:%lu lhVoqOver:%lu lhResume:%lu throttle:%lu maxLhInflight:%lu maxActiveVoq:%u time:%f\n",
+    printf("+++atcGateway diag reason:%s gatewayType:%d activeVoqs:%u enqBytes:%lu sentBytes:%lu blockedInflight:%lu ack:%lu cnpAck:%lu ackDeducted:%lu maxQueueBytes:%lu maxQueuePkts:%lu maxVoqInflight:%lu lhRecv:%lu lhSent:%lu lhOver:%lu lhVoqOver:%lu lhResume:%lu throttle:%lu maxLhInflight:%lu maxActiveVoq:%u voqBypassPackets:%lu voqBypassBytes:%lu time:%f\n",
            reason, m_gatewayType, activeVoqs, totalEnqueued, totalSent, totalBlocked, totalAck, totalCnpAck,
            totalAckDeducted, maxQueueBytes, maxQueueLen, maxVoqInflight, m_diagLongHaulFeedbackRecv,
            m_diagLongHaulFeedbackSent, m_diagLongHaulOverInflight, m_diagLongHaulVoqOverload,
-           m_diagLongHaulResume, m_diagThrottleCalls, m_diagMaxLongHaulInflight, m_diagMaxActiveVoqCount,
+           m_diagLongHaulResume, m_diagThrottleCalls, m_diagMaxLongHaulInflight, m_diagMaxActiveVoqCount, m_voqBypassPackets, m_voqBypassBytes,
            Simulator::Now().GetSeconds());
 }
 
@@ -174,7 +173,7 @@ uint16_t atcGateway::EtherToPpp (uint16_t proto) {
 // ========== VOQ管理函数 ==========
 
 // 分配VOQ
-uint32_t atcGateway::AllocateVoq(Ipv4Address destIp) {
+int32_t atcGateway::AllocateVoq(Ipv4Address destIp) {
     // 检查是否已分配
     auto it = destToVoqMap.find(destIp);
     if (it != destToVoqMap.end()) {
@@ -226,6 +225,14 @@ void atcGateway::ReleaseVoq(uint32_t voqId) {
         // 重置VOQ状态
         voq.isAllocated = false;
         voq.currentSize = 0;
+        voq.flights.clear();
+        voq.currentInflightBytes = 0;
+        Simulator::Cancel(voq.mlx.m_eventUpdateAlpha);
+        Simulator::Cancel(voq.mlx.m_eventDecreaseRate);
+        Simulator::Cancel(voq.mlx.m_rpTimer);
+        voq.mlx = {};
+        voq.mlx.m_alpha = 1;
+        voq.mlx.m_first_cnp = true;
         voq.lastTransmitTime = Seconds(0);
         
         // 从映射中移除
@@ -294,22 +301,31 @@ void atcGateway::TransmitFromVoq(uint32_t voqId) {
     pkt->PeekHeader(ch);
     uint32_t pktSize = pkt->GetSize();
 
-    // 限制转发字节数在下游DC 的bdp内
-    if (voq.currentInflightBytes < voq.maxInflightBytes) 
+    auto [it, inserted] = voq.flights.try_emplace(
+        VoqEntry::FlowKey{ch.sip, ch.udp.sport, ch.udp.dport, ch.udp.pg});
+    auto& flight = it->second;
+    if (inserted)
+        flight.nextSeq = ch.udp.seq;
+    // Only an in-order advance creates new ACKable flight. Out-of-order
+    // packets still traverse the paced output so the NIC can report the gap.
+    const bool advances = ch.udp.seq == flight.nextSeq;
+    if (!advances || voq.currentInflightBytes < voq.maxInflightBytes)
     {
         voq.packetQueue.pop();
         voq.currentSize -= pktSize;
         voq.diagPacketsSent++;
         voq.diagBytesSent += pktSize;
 
-        RecordRemoteForwarded(pkt);
-        
         // 转发数据包
         DoSwitchSendToDev(pkt, ch);
 
         // 报文统计
-        voq.currentInflightBytes += pktSize;
-        voq.diagMaxInflightBytes = std::max(voq.diagMaxInflightBytes, voq.currentInflightBytes);
+        if (advances) {
+            flight.nextSeq = ch.udp.seq + (pktSize - ch.GetSerializedSize());
+            flight.outstanding.emplace_back(flight.nextSeq, pktSize);
+            voq.currentInflightBytes += pktSize;
+            voq.diagMaxInflightBytes = std::max(voq.diagMaxInflightBytes, voq.currentInflightBytes);
+        }
     }
     else
     {
@@ -548,6 +564,11 @@ bool atcGateway::packetIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &
 
     if (m_gatewayType == 1) { // 发送端门廊
         if (ch.l3Prot == 0x11) { // RDMA UDP数据报文
+            // A collapsed spine/DCI also forwards local traffic. Only WAN
+            // egresses belong to the source gateway's long-haul accounting.
+            auto egress = GetOutDevice(pkt, ch);
+            if (!egress || !egress->IsWanPort())
+                return false;
             m_ecnbits = ch.GetIpv4EcnBits();
             bool triggerByPacketEcn = (m_ecnbits != 0);
             bool triggerByGlobalCongestion = (m_cnpOnGlobalCongestion && m_congested);
@@ -568,18 +589,26 @@ bool atcGateway::packetIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &
                     }
                 }
             }
-            longHaulState.localSentBytes += pkt->GetSize();
             return false;
         }
         else if (ch.l3Prot == 0x6) { // LongHaulFeedback
+            auto ingress = DynamicCast<QbbNetDevice>(device);
+            if (!ingress || !ingress->IsWanPort())
+                return false;
             return HandleLongHaulFeedback(device, pkt, ch);
         }
     }
     else if (m_gatewayType == 2) { // 接收端门廊（VOQ模式）
         if (ch.l3Prot == 0x11) { // RDMA UDP数据报文
+            auto ingress = DynamicCast<QbbNetDevice>(device);
+            if (!ingress || !ingress->IsWanPort())
+                return false;
             return HandleDataPacketWithVoq(device, pkt, ch);
         }
-        else if (ch.l3Prot == 0xFC) { // RDMA ACK报文
+        else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD) { // cumulative ACK or go-back-N NACK
+            auto egress = GetOutDevice(pkt, ch);
+            if (!egress || !egress->IsWanPort())
+                return false;
             return HandleAckPacketWithVoq(device, pkt, ch);
         }
     }
@@ -610,20 +639,22 @@ bool atcGateway::HandleDataPacketWithVoq(Ptr<NetDevice> device, Ptr<Packet> pkt,
 
     Ptr<QbbNetDevice> qbbDevice = DynamicCast<QbbNetDevice>(device);
     if (qbbDevice && qbbDevice->IsWanPort()) {
-        RegisterLongHaulPeer(qbbDevice->GetIfIndex(), qbbDevice->GetNode()->GetId(), ch);
+        RegisterLongHaulPeer(qbbDevice->GetIfIndex(), qbbDevice->GetNode()->GetId(), ch, qbbDevice);
     }
     
-    // 使用VOQ调度
-    int32_t voqId = AllocateVoq(destIp);
-    if (voqId < 0) {
-        // 没有可用VOQ，直接转发清理后的数据包
-        RecordRemoteForwarded(cleanPkt);
+    const uint32_t packetBytes = cleanPkt->GetSize();
+    const uint32_t requiredSpace = std::max<uint32_t>(device->GetMtu(), packetBytes);
+    const int32_t voqId = requiredSpace <= m_voqMaxSize ? AllocateVoq(destIp) : -1;
+    // ATC §IV-B: bypass the VOQ when less than one MTU remains. Direct
+    // packets go through normal switch admission and count as WAN service.
+    if (voqId < 0 || voqPool[voqId].maxSize - voqPool[voqId].currentSize < requiredSpace) {
+        ++m_voqBypassPackets;
+        m_voqBypassBytes += packetBytes;
         DoSwitchSendToDev(cleanPkt, ch);
-        return true; // 拦截原始数据包
+        return true;
     }
-    
+
     VoqEntry& voq = voqPool[voqId];
-    
     // 将清理后的数据包存储到VOQ
     voq.packetQueue.push(cleanPkt);
     voq.currentSize += cleanPkt->GetSize();
@@ -633,9 +664,6 @@ bool atcGateway::HandleDataPacketWithVoq(Ptr<NetDevice> device, Ptr<Packet> pkt,
     voq.diagMaxQueueLen = std::max<uint64_t>(voq.diagMaxQueueLen, voq.packetQueue.size());
     VoqStat();
 
-    if (m_packet_size == 0) {
-        m_packet_size = cleanPkt->GetSize();
-    }
     
     // 触发VOQ转发（使用VOQ自身的速率）
     if (!voq.transmitEvent.IsRunning()) {
@@ -663,16 +691,28 @@ bool atcGateway::HandleAckPacketWithVoq(Ptr<NetDevice> device, Ptr<Packet> pkt, 
         uint32_t voqId = voqIt->second;
         VoqEntry& voq = voqPool[voqId];
 
-        uint64_t beforeInflight = voq.currentInflightBytes;
-        if (voq.currentInflightBytes >= m_packet_size) {
-            voq.currentInflightBytes -= m_packet_size;
-        }
-        else {
-            voq.currentInflightBytes = 0;
+        auto it = voq.flights.find({ch.dip, ch.ack.dport, ch.ack.sport, ch.ack.pg});
+        if (it != voq.flights.end() && ch.ack.seq >= it->second.acknowledged) {
+            auto& flight = it->second;
+            flight.acknowledged = ch.ack.seq;
+            while (!flight.outstanding.empty() && flight.outstanding.front().first <= ch.ack.seq) {
+                const uint32_t bytes = flight.outstanding.front().second;
+                voq.currentInflightBytes -= bytes;
+                voq.diagAckBytesDeducted += bytes;
+                flight.outstanding.pop_front();
+            }
+            if (ch.l3Prot == 0xFD) {
+                // The receiver discarded this suffix and requested go-back-N.
+                // Release its credit; later attempts are charged as they advance.
+                for (const auto& packet : flight.outstanding)
+                    voq.currentInflightBytes -= packet.second;
+                flight.outstanding.clear();
+                flight.nextSeq = ch.ack.seq;
+            } else {
+                flight.nextSeq = std::max(flight.nextSeq, ch.ack.seq);
+            }
         }
         voq.diagAckCount++;
-        voq.diagAckBytesDeducted += beforeInflight - voq.currentInflightBytes;
-        
         // 处理CNP
         if (cnp) {
             voq.diagCnpAckCount++;
@@ -708,6 +748,9 @@ void atcGateway::ThrottleLocalForwarding(Ptr<NetDevice> dev, uint64_t rate) {
 // 处理LongHaulFeedback
 bool atcGateway::HandleLongHaulFeedback(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) {
 
+    LongHaulState& state = sourceWanStates.empty() ? longHaulState :
+        sourceWanStates.at(device->GetIfIndex());
+
     uint64_t remoteForwardedBytes =  (((uint64_t)ch.tcp.ack) << 32) | (uint64_t)ch.tcp.seq;
     uint32_t activeVoqCount = ch.tcp.dport;
     uint64_t rateLimit = 0;
@@ -720,81 +763,93 @@ bool atcGateway::HandleLongHaulFeedback(Ptr<NetDevice> device, Ptr<Packet> pkt, 
 
     if (m_debug & 0x2)
          printf("+++atcGateway recv LongHaulFeedback localSentBytes:%lu remoteForwardedBytes:%lu  inflightBytes:%lu activeVoqCount:%d  time:%f node:%u sourceIf:%u counterMismatch:%u\n",
-            longHaulState.localSentBytes,remoteForwardedBytes,
-            longHaulState.localSentBytes >= remoteForwardedBytes ? longHaulState.localSentBytes - remoteForwardedBytes : 0,
+            state.localSentBytes,remoteForwardedBytes,
+            state.localSentBytes >= remoteForwardedBytes ? state.localSentBytes - remoteForwardedBytes : 0,
             activeVoqCount,Simulator::Now().GetSeconds(),device->GetNode()->GetId(),device->GetIfIndex(),
-            remoteForwardedBytes > longHaulState.localSentBytes ? 1u : 0u);
+            remoteForwardedBytes > state.localSentBytes ? 1u : 0u);
 
-    if (longHaulState.localSentBytes > remoteForwardedBytes) {
-        uint64_t inflightBytes = longHaulState.localSentBytes - remoteForwardedBytes;
+    if (state.localSentBytes >= remoteForwardedBytes) {
+        uint64_t inflightBytes = state.localSentBytes - remoteForwardedBytes;
         m_diagMaxLongHaulInflight = std::max(m_diagMaxLongHaulInflight, inflightBytes);
         
         // 若在途字节数超过阈值，限流
-        if (inflightBytes > longHaulState.maxInflightBytes) {
+        if (inflightBytes > state.maxInflightBytes) {
             m_diagLongHaulOverInflight++;
             
-            if (longHaulState.inflightBytes > 0 && longHaulState.lastLocalSentBytes > 0 && inflightBytes > longHaulState.inflightBytes && longHaulState.localSentBytes > longHaulState.lastLocalSentBytes)
+            if (state.inflightBytes > 0 && state.lastLocalSentBytes > 0 && inflightBytes > state.inflightBytes && state.localSentBytes > state.lastLocalSentBytes)
             {
                 double ratio = 0.9;
-                ratio = (double) (inflightBytes - longHaulState.inflightBytes) / (longHaulState.localSentBytes - longHaulState.lastLocalSentBytes);
+                ratio = (double) (inflightBytes - state.inflightBytes) / (state.localSentBytes - state.lastLocalSentBytes);
                 if (ratio >= 0.05 && ratio <= 0.95)
                 {
                     double K = 1.0 / m_maxVoqCount;
                     ratio = 1.0 - ratio;
-                    rateLimit = ratio*longHaulState.longHaulBandwidth;
-                    if ((rateLimit != longHaulState.rateLimit) && (ratio >= K)) //波动才限流
+                    rateLimit = ratio*state.longHaulBandwidth;
+                    if ((rateLimit != state.rateLimit) && (ratio >= K)) //波动才限流
                     {
                         ThrottleLocalForwarding(device, rateLimit); // 限流
                     }
-                    longHaulState.rateLimit = rateLimit;
+                    state.rateLimit = rateLimit;
                 }
                 limit = true;
                 if (m_debug & 0x2)
-                    printf("+++atcGateway  LongHaulFeedback overinfligh inflightBytes:%lu lastinflightBytes:%lu rateLimit:%lu ratio:%f time:%f\n",inflightBytes,longHaulState.inflightBytes,longHaulState.rateLimit,ratio,Simulator::Now().GetSeconds());
+                    printf("+++atcGateway  LongHaulFeedback overinfligh inflightBytes:%lu lastinflightBytes:%lu rateLimit:%lu ratio:%f time:%f\n",inflightBytes,state.inflightBytes,state.rateLimit,ratio,Simulator::Now().GetSeconds());
             }
         }
         
-        longHaulState.remoteForwardedBytes = remoteForwardedBytes;
-        longHaulState.inflightBytes = inflightBytes;
+        state.remoteForwardedBytes = remoteForwardedBytes;
+        state.inflightBytes = inflightBytes;
      }
-     longHaulState.lastLocalSentBytes = longHaulState.localSentBytes;
+     state.lastLocalSentBytes = state.localSentBytes;
 
     
     if (activeVoqCount <= m_maxVoqCount) {
         // VOQ过载时限流
-        longHaulState.activeVoqCount = activeVoqCount;
+        state.activeVoqCount = activeVoqCount;
         bool voqOverload = activeVoqCount > (N_THRESHOLD_RATIO * m_maxVoqCount);
         if (voqOverload) {
             m_diagLongHaulVoqOverload++;
             double K = 1.0 / m_maxVoqCount;
-            rateLimit = K*longHaulState.longHaulBandwidth;
-            if (rateLimit != longHaulState.rateLimit) //波动才限流
+            rateLimit = K*state.longHaulBandwidth;
+            if (rateLimit != state.rateLimit) //波动才限流
             {
                 ThrottleLocalForwarding(device, rateLimit); // 限流
             }
-            longHaulState.rateLimit = rateLimit;
+            state.rateLimit = rateLimit;
             limit = true;
             if (m_debug & 0x2)
-                printf("+++atcGateway  LongHaulFeedback voqOverload activeVoqCount:%d K:%f rateLimit:%lu time:%f\n",activeVoqCount,K,longHaulState.rateLimit,Simulator::Now().GetSeconds());
+                printf("+++atcGateway  LongHaulFeedback voqOverload activeVoqCount:%d K:%f rateLimit:%lu time:%f\n",activeVoqCount,K,state.rateLimit,Simulator::Now().GetSeconds());
         }
     }
 
-    if (!limit && longHaulState.rateLimit < longHaulState.longHaulBandwidth) {
+    if (!limit && state.rateLimit < state.longHaulBandwidth) {
         m_diagLongHaulResume++;
-        longHaulState.rateLimit = longHaulState.longHaulBandwidth;
-        ThrottleLocalForwarding(device, longHaulState.rateLimit);
+        state.rateLimit = state.longHaulBandwidth;
+        ThrottleLocalForwarding(device, state.rateLimit);
         if (m_debug & 0x2)
-             printf("+++atcGateway LongHaulFeedback resume sendRate rateLimit:%lu time:%f\n",longHaulState.rateLimit,Simulator::Now().GetSeconds());
+             printf("+++atcGateway LongHaulFeedback resume sendRate rateLimit:%lu time:%f\n",state.rateLimit,Simulator::Now().GetSeconds());
     }
 
     return true; 
 }
 
 // 初始化长距离状态
+void atcGateway::ConfigureSourceWanPort(uint32_t port, uint64_t bandwidth, Time delay) {
+    auto& state = sourceWanStates[port];
+    state = longHaulState;
+    state.longHaulBandwidth = bandwidth;
+    state.longHaulDelay = delay;
+    state.maxInflightBytes = bandwidth * (M * delay.GetSeconds() +
+                                             LONGHAUL_FEEDBACK_PERIOD.GetSeconds()) / 8;
+    state.rateLimit = bandwidth;
+}
+
 void atcGateway::InitLongHaulState(uint64_t longHaulBandwidth,Time longHaulDelay) {
+    sourceWanStates.clear();
     longHaulState.longHaulBandwidth = longHaulBandwidth;
     longHaulState.longHaulDelay = longHaulDelay;
     longHaulState.localSentBytes = 0;
+    longHaulState.lastLocalSentBytes = 0;
     longHaulState.lastLocalSentBytes = 0;
     longHaulState.remoteForwardedBytes = 0;
     longHaulState.inflightBytes = 0;
@@ -813,13 +868,14 @@ void atcGateway::InitLongHaulState(uint64_t longHaulBandwidth,Time longHaulDelay
 }
 
 void atcGateway::RegisterLongHaulPeer(uint32_t ingressIfIndex, uint32_t nodeId,
-                                     const CustomHeader& ch) {
+                                     const CustomHeader& ch, Ptr<QbbNetDevice> device) {
     auto inserted = longHaulFeedbackPeers.emplace(ingressIfIndex, LongHaulFeedbackPeer());
     if (!inserted.second) {
         return;
     }
     inserted.first->second.routeHeader = ch;
     inserted.first->second.nodeId = nodeId;
+    inserted.first->second.wanDevice = device;
     if (m_debug & 0x2) {
         printf("+++atcGateway longHaulPeer node:%u peerIf:%u peerSip:%u time:%f\n",
                nodeId, ingressIfIndex, ch.sip, Simulator::Now().GetSeconds());
@@ -829,9 +885,16 @@ void atcGateway::RegisterLongHaulPeer(uint32_t ingressIfIndex, uint32_t nodeId,
     }
 }
 
-void atcGateway::RecordRemoteForwarded(Ptr<const Packet> packet) {
-    // QbbNetDevice attaches the local ingress before PacketIn. Packet::Copy
-    // preserves this tag while different WANs share the same destination VOQ.
+void atcGateway::RecordDataDequeue(Ptr<QbbNetDevice> egress, Ptr<const Packet> packet) {
+    if (m_gatewayType == 1 && egress->IsWanPort()) {
+        longHaulState.localSentBytes += packet->GetSize();
+        if (!sourceWanStates.empty())
+            sourceWanStates.at(egress->GetIfIndex()).localSentBytes += packet->GetSize();
+        return;
+    }
+    if (m_gatewayType != 2 || egress->IsWanPort()) return;
+
+    // The WAN ingress tag remains attached until the local egress dequeues.
     InterfaceTag ingress;
     if (!packet->PeekPacketTag(ingress)) {
         return;
@@ -839,7 +902,6 @@ void atcGateway::RecordRemoteForwarded(Ptr<const Packet> packet) {
     auto peer = longHaulFeedbackPeers.find(ingress.GetPortId());
     if (peer != longHaulFeedbackPeers.end()) {
         peer->second.remoteForwardedBytes += packet->GetSize();
-        longHaulState.remoteForwardedBytes += packet->GetSize();
     }
 }
 
@@ -855,11 +917,13 @@ void atcGateway::GenerateLongHaulFeedback() {
     for (const auto& entry : longHaulFeedbackPeers) {
         const uint32_t ingressIfIndex = entry.first;
         const LongHaulFeedbackPeer& peer = entry.second;
+        if (peer.wanDevice && !peer.wanDevice->IsLinkUp())
+            continue;
         // 用TCP头封装LongHaulFeedback
         TcpHeader seqh;
         seqh.SetDestinationPort(longHaulState.activeVoqCount);
-        seqh.SetSequenceNumber(SequenceNumber32((uint32_t)(peer.remoteForwardedBytes & 0xFFFFFFFF)));
-        seqh.SetAckNumber(SequenceNumber32((uint32_t)((peer.remoteForwardedBytes >> 32) & 0xFFFFFFFF)));
+        seqh.SetSequenceNumber(SequenceNumber32(static_cast<uint32_t>(peer.remoteForwardedBytes)));
+        seqh.SetAckNumber(SequenceNumber32(static_cast<uint32_t>(peer.remoteForwardedBytes >> 32)));
 
         Ptr<Packet> newp = Create<Packet>(std::max(60 - 14 - 20 - (int)seqh.GetSerializedSize(), 0));
         newp->AddHeader(seqh);
@@ -884,7 +948,12 @@ void atcGateway::GenerateLongHaulFeedback() {
 
         CustomHeader bfCh(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
         newp->PeekHeader(bfCh);
-        DoSwitchSendToDev(newp, bfCh);
+        // Return on the exact WAN that owns this counter, before ECMP can
+        // select another source gateway or another source WAN interface.
+        if (peer.wanDevice)
+            peer.wanDevice->SwitchSend(0, newp, bfCh);
+        else
+            DoSwitchSendToDev(newp, bfCh);
         m_diagLongHaulFeedbackSent++;
         if ((m_diagLongHaulFeedbackSent % 1000) == 0) {
             PrintAtcDebugSummary("periodic-longhaul");

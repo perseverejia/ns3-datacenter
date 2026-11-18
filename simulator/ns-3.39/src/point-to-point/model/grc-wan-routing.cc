@@ -25,8 +25,10 @@
 #include "grc-wan-routing.h"
 
 #include "grc-settings.h"
+#include "rdma-queue-pair.h"
 
 #include "ns3/abort.h"
+#include "ns3/config.h"
 #include "ns3/qbb-header.h"
 #include <ns3/ipv4-header.h>
 #include <ns3/ppp-header.h>
@@ -44,7 +46,6 @@ namespace ns3
 namespace
 {
 constexpr double kInitialWBeforeK = 2.5;
-constexpr uint32_t kRttIdentifierMask = 0x00ffffff;
 
 void
 ClearIpv4EcnMark(Ptr<Packet> p, CustomHeader& ch)
@@ -107,13 +108,12 @@ GrcWanRouting::DstDCHandler::Init(GrcWanRouting* wan_routing, int64_t max_rate)
 void
 GrcWanRouting::DstDCHandler::record_rtt(Time rtt, Time rto)
 {
-    // A retransmission can refresh the timestamp while the original ACK is still in flight.
-    // Section III-B rejects samples more than one RTO below the current RTT estimate.
-    // This heuristic does not reject all ambiguous samples from retransmissions within an RTO.
+    // Retain the controller's existing Section III-B stale-sample heuristic.
     if (rtt + rto < sensitive_rtt)
     {
         return;
     }
+    if (rtt_num == 0 || rtt < epoch_min_sample) epoch_min_sample = rtt;
     rtt_sum += rtt;
     rtt_num++;
 
@@ -178,10 +178,13 @@ GrcWanRouting::DstDCHandler::update_and_check_cnp(uint32_t pkt_size)
 }
 
 void
-GrcWanRouting::Init(Ptr<Node> node, uint32_t dc, const std::map<uint32_t, uint32_t>& routes)
+GrcWanRouting::Init(Ptr<Node> node, uint32_t dc,
+                    const std::map<uint32_t, std::vector<uint32_t>>& routes)
 {
     m_switch_id = node->GetId();
     m_dc = dc;
+    Config::ConnectWithoutContextFailSafe("/NodeList/*/$ns3::RdmaDriver/QpComplete",
+                                          MakeCallback(&GrcWanRouting::ForgetFlow, this));
     std::seed_seq seed{static_cast<uint32_t>(std::stoul(GrcSettings::raw.at("GRC_SEED"))),
                        m_switch_id};
     m_rng.seed(seed);
@@ -190,10 +193,12 @@ GrcWanRouting::Init(Ptr<Node> node, uint32_t dc, const std::map<uint32_t, uint32
     epoch_duration = MicroSeconds(std::stoll(GrcSettings::raw.at("WAN_EPOCH_US")));
     m_rtt_entry_timeout = MicroSeconds(std::stoll(GrcSettings::raw.at("RTT_ENTRY_TIMEOUT_US")));
     m_rtt_rto_filter = MicroSeconds(std::stoll(GrcSettings::raw.at("RTT_RTO_FILTER_US")));
-    for (const auto& [dst, port] : routes)
+    for (const auto& [dst, ports] : routes)
     {
         auto& handler = m_dcHandler[dst];
-        int64_t max_rate = DynamicCast<QbbNetDevice>(node->GetDevice(port))->GetDataRate().GetBitRate() / 8;
+        int64_t max_rate = 0;
+        for (uint32_t port : ports)
+            max_rate += DynamicCast<QbbNetDevice>(node->GetDevice(port))->GetDataRate().GetBitRate() / 8;
         handler.Init(this, max_rate);
     }
     m_epoch_start_time = NanoSeconds(std::stoll(GrcSettings::raw.at("EPOCH_START_NS")));
@@ -238,26 +243,7 @@ GrcWanRouting::HandleUdpReceived(Ptr<Packet> p, CustomHeader& ch)
     auto& dc_handler = it->second;
     // per-epoch statistics
     dc_handler.epoch_pkt_cnt++;
-    // RTT过滤
-    // Sample DATA on the DCI. Matching cumulative ACK sequence numbers provide
-    // the second sampling level; no endpoint tag or ACK-policy modification.
-    const uint32_t seq_end = ch.udp.seq + p->GetSize() - ch.GetSerializedSize();
-    const uint32_t hashed_seq =
-        Hash4TupleSeq(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, seq_end) & kRttIdentifierMask;
-    const uint32_t index =
-        GetRttTableIndex(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, seq_end);
-    auto& entry = rtt_table[index];
-    // Refresh a retransmitted sample. A separate validity bit allows identifier zero.
-    if (entry.valid && entry.hashed_seq == hashed_seq)
-    {
-        entry.timestamp = Simulator::Now();
-    }
-    else if (!entry.valid || Simulator::Now() - entry.timestamp > m_rtt_entry_timeout)
-    {
-        entry.valid = true;
-        entry.hashed_seq = hashed_seq;
-        entry.timestamp = Simulator::Now();
-    }
+    TrackRttSend(ch, ch.udp.seq + (p->GetSize() - ch.GetSerializedSize()));
     const bool ecn_marked = ch.GetIpv4EcnBits() != 0;
     // Algorithm 3 accounts for every packet before testing RED or an existing ECN mark.
     const bool rate_cnp = dc_handler.update_and_check_cnp(p->GetSize());
@@ -276,6 +262,45 @@ GrcWanRouting::HandleUdpReceived(Ptr<Packet> p, CustomHeader& ch)
 }
 
 void
+GrcWanRouting::ForgetFlow(Ptr<RdmaQueuePair> qp)
+{
+    const RttFlow flow{qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, qp->m_pg};
+    if (!m_highestSentEnd.erase(flow)) return;
+    const uint32_t first = GetRttTableIndex(qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, 0) & ~15u;
+    for (uint32_t i = first; i < first + 16; ++i)
+        if (rtt_table[i].valid && rtt_table[i].flow == flow)
+            rtt_table[i].valid = false;
+}
+
+void
+GrcWanRouting::TrackRttSend(const CustomHeader& ch, uint32_t seqEnd)
+{
+    const RttFlow flow{ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, ch.udp.pg};
+    auto it = m_highestSentEnd.find(flow);
+    if (it == m_highestSentEnd.end())
+    {
+        // Start observing at the beginning of the QP; a late suffix after
+        // completion cannot open a new RTT measurement for the old QP.
+        if (ch.udp.seq != 0) return;
+        it = m_highestSentEnd.emplace(flow, 0).first;
+    }
+    auto& highestEnd = it->second;
+    auto& entry = rtt_table[GetRttTableIndex(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, seqEnd)];
+    if (ch.udp.seq < highestEnd)
+    {
+        // A cumulative ACK cannot distinguish transmissions of the same bytes.
+        // Cancel that sample even if the original is still in flight (Karn).
+        if (entry.valid && entry.flow == flow && entry.seqEnd == seqEnd)
+            entry.valid = false;
+    }
+    else if (!entry.valid || Simulator::Now() - entry.timestamp > m_rtt_entry_timeout)
+    {
+        entry = {true, flow, seqEnd, Simulator::Now()};
+    }
+    highestEnd = std::max(highestEnd, seqEnd);
+}
+
+void
 GrcWanRouting::HandleAckReceived(Ptr<Packet> p, CustomHeader& ch)
 {
     auto dcIt = m_dcHandler.find(GrcSettings::hostIpToDc.at(ch.sip));
@@ -286,16 +311,12 @@ GrcWanRouting::HandleAckReceived(Ptr<Packet> p, CustomHeader& ch)
         return;
     }
     auto& dcHandler = dcIt->second;
-    const uint32_t hashed_seq =
-        Hash4TupleSeq(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.seq) & kRttIdentifierMask;
-    const uint32_t index = GetRttTableIndex(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.seq);
-    if (rtt_table[index].valid && rtt_table[index].hashed_seq == hashed_seq)
+    const RttFlow flow{ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.pg};
+    auto& entry = rtt_table[GetRttTableIndex(ch.dip, ch.sip, ch.ack.dport, ch.ack.sport, ch.ack.seq)];
+    if (entry.valid && entry.flow == flow && entry.seqEnd == ch.ack.seq)
     {
-        Time rtt = Simulator::Now() - rtt_table[index].timestamp;
-        // Keep upstream's cross-DC stale-sample heuristic. This is a controller
-        // filter only; it does not configure endpoint retransmission behavior.
-        dcHandler.record_rtt(rtt, m_rtt_rto_filter);
-        rtt_table[index].valid = false;
+        dcHandler.record_rtt(Simulator::Now() - entry.timestamp, m_rtt_rto_filter);
+        entry.valid = false;
     }
     m_switchSendToDevCallback(p, ch);
 }
@@ -363,7 +384,7 @@ GrcWanRouting::controlplane_logic()
             fprintf(
                 GrcLog::controller,
                 "%lld,%u,%u,%u,%llu,%lld,%lld,%d,%lld,%lld,%lld,%lld,%.12g,%.12g,"
-                "%.12g,%llu,%llu,%lld,%lld,%lld,%d,%u\n",
+                "%.12g,%llu,%llu,%lld,%lld,%lld,%d,%u,%lld\n",
                 static_cast<long long>(Simulator::Now().GetNanoSeconds()),
                 m_switch_id,
                 m_dc,
@@ -385,7 +406,8 @@ GrcWanRouting::controlplane_logic()
                 static_cast<long long>(dc_handler.end_bytes),
                 static_cast<long long>(cur_bytes_before),
                 static_cast<int>(dc_handler.rate_change_state),
-                dc_handler.consecutive_state_epochs);
+                dc_handler.consecutive_state_epochs,
+                static_cast<long long>(dc_handler.rtt_num ? dc_handler.epoch_min_sample.GetNanoSeconds() : -1));
         }
         dc_handler.total_send_bytes = 0;
         dc_handler.rtt_sum = Seconds(0);
@@ -643,25 +665,6 @@ GrcWanRouting::Hash4Tuple(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t d
     buf.u32[1] = dip;
     buf.u32[2] = sport | ((uint32_t)dport << 16);
     return ECMPHash(buf.u8, 12, m_hash_seed1);
-}
-
-uint32_t
-GrcWanRouting::Hash4TupleSeq(uint32_t sip,
-                             uint32_t dip,
-                             uint16_t sport,
-                             uint16_t dport,
-                             uint32_t seq)
-{
-    union {
-        uint8_t u8[4 + 4 + 2 + 2 + 4];
-        uint32_t u32[4];
-    } buf;
-
-    buf.u32[0] = sip;
-    buf.u32[1] = dip;
-    buf.u32[2] = sport | ((uint32_t)dport << 16);
-    buf.u32[3] = seq;
-    return ECMPHash(buf.u8, 16, m_hash_seed2);
 }
 
 uint32_t

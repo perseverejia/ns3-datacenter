@@ -20,6 +20,8 @@
 
 #include <iostream>
 #include <fstream>
+#include <iomanip>
+#include <optional>
 #include <unordered_map>
 #include <set>
 #include <time.h>
@@ -69,7 +71,7 @@ bool enable_qcn = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
 uint32_t query_auto_stop = 1;  // 1: 查询流完成后自动停止仿真, 0: 运行到 SIMULATOR_STOP_TIME
-std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_output_file;
+std::string data_rate, link_delay, topology_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
 
@@ -189,7 +191,7 @@ unordered_map<uint64_t, double> rate2pmax;
 /************************************************
  * Runtime varibles
  ***********************************************/
-std::ifstream topof, flowf, tracef;
+std::ifstream topof, tracef;
 
 NodeContainer n;
 NetDeviceContainer switchToSwitchInterfaces;
@@ -212,6 +214,9 @@ uint64_t maxRtt, maxBdp;
 
 // Interface 结构体现在在 workload-generator.h 中定义
 map<Ptr<Node>, map<Ptr<Node>, Interface> > nbr2if;
+// BFS uses one representative edge per neighbor; forwarding retains every
+// physical interface so parallel 100G links all participate in ECMP.
+map<Ptr<Node>, map<Ptr<Node>, vector<Interface>>> neighborInterfaces;
 // Mapping destination to next hop for each node: <node, <dest, <nexthop0, ...> > >
 map<Ptr<Node>, map<Ptr<Node>, vector<Ptr<Node> > > > nextHop;
 map<Ptr<Node>, map<Ptr<Node>, uint64_t> > pairDelay;
@@ -221,10 +226,6 @@ map<Ptr<Node>, map<Ptr<Node>, uint64_t> > pairBdp;
 map<uint32_t, map<uint32_t, uint64_t> > pairRtt;
 
 std::vector<Ipv4Address> serverAddress;
-
-// maintain port number for each host pair
-std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t> > portNumder;
-std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t> > DestportNumder;
 
 std::vector<uint32_t> allHostIds;
 std::vector<uint32_t> hostFacingLeafIds;
@@ -245,38 +246,7 @@ uint64_t g_longDistanceRtt = 0;  // Will be set from topology
 FILE* g_queryFlowFctFile = nullptr;
 
 // FlowInput 结构体现在在 workload-generator.h 中定义
-FlowInput flow_input = {0};
-uint32_t flow_num;
 std::vector<FlowInput> flows;                              // 保存所有流的完整信息（含实际分配的 sport）
-
-void ReadFlowInput() {
-	if (flow_input.idx < flow_num) {
-		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.dport >> flow_input.maxPacketCount >> flow_input.start_time;
-		std::cout << "Flow " << flow_input.src << " " << flow_input.dst << " " << flow_input.pg << " " << flow_input.dport << " " << flow_input.maxPacketCount << " " << flow_input.start_time << " " << Simulator::Now().GetSeconds() << std::endl;
-		NS_ASSERT(n.Get(flow_input.src)->GetNodeType() == 0 && n.Get(flow_input.dst)->GetNodeType() == 0);
-		flows.push_back(flow_input);  // 保存流记录（此时 port 尚未分配，由 ScheduleFlowInputs 回填）
-	}
-}
-void ScheduleFlowInputs() {
-	while (flow_input.idx < flow_num && Seconds(flow_input.start_time) <= Simulator::Now()) {
-		uint32_t port = portNumder[flow_input.src][flow_input.dst]++; // get a new port number
-		flows[flow_input.idx].port = port;  // 回填实际分配的 sport，供 PrintResultsFlow 查找 RxQp
-		RdmaClientHelper clientHelper(flow_input.pg, serverAddress[flow_input.src], serverAddress[flow_input.dst], port, flow_input.dport, flow_input.maxPacketCount, has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(flow_input.src)][n.Get(flow_input.dst)]) : 0, global_t == 1 ? maxRtt : pairRtt[flow_input.src][flow_input.dst], Simulator::GetMaximumSimulationTime());
-		ApplicationContainer appCon = clientHelper.Install(n.Get(flow_input.src));
-//		appCon.Start(Seconds(flow_input.start_time));
-		appCon.Start(Seconds(0)); // setting the correct time here conflicts with Sim time since there is already a schedule event that triggered this function at desired time.
-		// get the next flow input
-		flow_input.idx++;
-		ReadFlowInput();
-	}
-
-	// schedule the next time to run this function
-	if (flow_input.idx < flow_num) {
-		Simulator::Schedule(Seconds(flow_input.start_time) - Simulator::Now(), ScheduleFlowInputs);
-	} else { // no more flows, close the file
-		flowf.close();
-	}
-}
 
 // 全局映射表：IP地址 -> 节点ID
 map<uint32_t, uint32_t> ipToNodeIdMap;  // key: IP (uint32_t), value: nodeId
@@ -506,26 +476,15 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 		serialization_delay += std::llround(8000000000.0L * (tail_payload_bytes + header_bytes) / b);
 	uint64_t standalone_fct = base_rtt + serialization_delay;
 	
-	// Check if this is a query flow by matching sip, dip, and dport
-	bool is_query = false;
-	const FlowInput* query_flow_info = nullptr;
-	for (const auto& flow : flows) {
-		if (serverAddress[flow.src].Get() == q->sip.Get() &&
-		    serverAddress[flow.dst].Get() == q->dip.Get() &&
-		    flow.dport == q->dport &&
-		    flow.is_query_flow) {
-			is_query = true;
-			query_flow_info = &flow;
-			break;
-		}
-	}
-	
+	const FlowInput* query_flow_info = FindFileFlow(sid, did, q->sport, q->dport);
+	const bool is_query = query_flow_info != nullptr;
+
 	// sip, dip, sport, dport, size (B), start_time, fct (ns), standalone_fct (ns), is_query_flow
 	fprintf(fout, "%08x %08x %u %u %lu %lu %lu %lu %d\n", q->sip.Get(), q->dip.Get(), q->sport, q->dport, q->m_size, q->startTime.GetTimeStep(), (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct, is_query ? 1 : 0);
 	fflush(fout);
 
-	// Write query flow to dedicated FCT file with node IDs and RTT compensation
-	if (is_query && query_flow_info && g_queryFlowFctFile != nullptr) {
+	// Write query flow to dedicated FCT file with node IDs
+	if (is_query && g_queryFlowFctFile != nullptr) {
 		uint64_t fct_ns = (Simulator::Now() - q->startTime).GetTimeStep();
 		
 		// Check if cross-DC flow using global topology mapping
@@ -533,8 +492,7 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 		
 		// Output format: src_node dst_node pg dport flow_size start_time_ns fct_ns is_cross_dc
 		fprintf(g_queryFlowFctFile, "%u %u %lu %lu %lu %lu %lu %d\n",
-		        query_flow_info->src,  // Source node ID
-		        query_flow_info->dst,  // Destination node ID
+		        sid, did,
 		        query_flow_info->pg,   // Priority group
 		        query_flow_info->dport, // Destination port
 		        query_flow_info->maxPacketCount, // Flow size in bytes
@@ -547,13 +505,13 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 	// Count query flow completion and stop simulation if all query flows are done
 	if (is_query) {
 		g_queryFlowCompleted++;
-		std::cout << "[QUERY FLOW] Completed " << g_queryFlowCompleted << "/" << g_totalQueryFlows 
-		          << " query flows at time " << Simulator::Now().GetSeconds() << "s" << std::endl;
+		std::cout << "[FILE FLOW] Completed " << g_queryFlowCompleted << "/" << g_totalQueryFlows
+		          << " file flows at time " << Simulator::Now().GetSeconds() << "s" << std::endl;
 		
 		// Stop simulation when all query flows complete (with 1ms grace period)
 		if (query_auto_stop && g_queryFlowCompleted >= g_totalQueryFlows && !g_simulationStopped) {
 			g_simulationStopped = true;
-			std::cout << "[QUERY FLOW] All " << g_totalQueryFlows << " query flows completed! Stopping simulation..." << std::endl;
+			std::cout << "[FILE FLOW] All " << g_totalQueryFlows << " file flows completed! Stopping simulation..." << std::endl;
 			Simulator::Stop(Seconds(0.001)); // Stop after 1ms grace period
 		}
 	}
@@ -720,11 +678,12 @@ void SetRoutingEntries() {
 			vector<Ptr<Node> > nexts = j->second;
 			for (int k = 0; k < (int)nexts.size(); k++) {
 				Ptr<Node> next = nexts[k];
-				uint32_t interface = nbr2if[node][next].idx;
-				if (node->GetNodeType())
-					DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
-				else {
-					node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface);
+				for (const auto& iface : neighborInterfaces.at(node).at(next)) {
+					if (!iface.up) continue;
+					if (node->GetNodeType())
+						DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, iface.idx);
+					else
+						node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, iface.idx);
 				}
 			}
 		}
@@ -746,8 +705,15 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
 		else
 			n.Get(i)->GetObject<RdmaDriver>()->m_rdma->ClearTable();
 	}
-	DynamicCast<QbbNetDevice>(a->GetDevice(nbr2if[a][b].idx))->TakeDown();
-	DynamicCast<QbbNetDevice>(b->GetDevice(nbr2if[b][a].idx))->TakeDown();
+	// LINK_DOWN names a node pair: disable the complete parallel bundle.
+	for (auto& iface : neighborInterfaces.at(a).at(b)) {
+		iface.up = false;
+		DynamicCast<QbbNetDevice>(a->GetDevice(iface.idx))->TakeDown();
+	}
+	for (auto& iface : neighborInterfaces.at(b).at(a)) {
+		iface.up = false;
+		DynamicCast<QbbNetDevice>(b->GetDevice(iface.idx))->TakeDown();
+	}
 	// reset routing table
 	SetRoutingEntries();
 
@@ -794,7 +760,8 @@ void PrintResults(std::map<uint32_t, NetDeviceContainer> ToR, uint32_t numToRs, 
 
 
 void PrintResultsFlow(double delay) {
-	for (auto &fi : flows) {
+	for (uint32_t index : GetFileFlowIndices()) {
+		auto& fi = flows.at(index);
 		// 获取目标节点的 RdmaDriver
 		Ptr<Node> dstNode = n.Get(fi.dst);
 		Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
@@ -813,9 +780,6 @@ void PrintResultsFlow(double delay) {
 		uint64_t current = rxQp->m_recv_bytes;
 		uint64_t last = fi.last_recv_bytes;
 		fi.last_recv_bytes = current;
-
-		// 首次采样：只记录基线，不输出（避免数据累积时间 ≠ delay 导致高估）
-		if (last == 0) continue;
 
 		double throughput = (current >= last) ?
 			double(current - last) * 8.0 / delay : 0.0;
@@ -852,6 +816,31 @@ void PrintResultsFlow(double delay) {
 
 
 
+std::string NormalizeFlowPath(const std::string& value)
+{
+	const auto first = value.find_first_not_of(" \t\r\n");
+	if (first == std::string::npos) return "";
+	const auto path = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+	if (path == "\"\"" || path == "''" || path == "none" || path == "NONE" || path == "-")
+		return "";
+	return path;
+}
+
+std::string ReadOptionalFlowPath(std::istream& config)
+{
+	std::string line, path;
+	std::getline(config, line);
+	std::istringstream value(line);
+	value >> std::ws;
+	if (value.eof() || value.peek() == '#') return "";
+	const char delimiter = value.peek() == '\'' ? '\'' : '"';
+	value >> std::quoted(path, delimiter);
+	NS_ABORT_MSG_IF(value.fail(), "Invalid flow file path: " << line);
+	value >> std::ws;
+	NS_ABORT_MSG_IF(!value.eof() && value.peek() != '#', "Quote flow paths containing spaces: " << line);
+	return NormalizeFlowPath(path);
+}
+
 int main(int argc, char *argv[])
 {
 	clock_t begint, endt;
@@ -869,19 +858,21 @@ int main(int argc, char *argv[])
 	double FLOW_LAUNCH_END_TIME = 0.045;
 	double load = 0.2;
 	unsigned randomSeed = 7;
-	std::string queryFlowFile = "examples/CrossDC-Algos/config/query-flow/query-flow-2-2.txt";
+	FileFlowParameters fileParameters;
 	std::string queryFlowFctFile = "";  // Will be set via command line
+	std::string queryFlowFile;
+	std::optional<std::string> configuredQueryFlowFile, queryFlowFileOverride;
 
 	uint32_t algorithm = 3;
 	std::map<std::string, std::string> grcParameters;
 	std::map<std::string, std::string> themisParameters;
 	uint32_t windowCheck = 1;
 	uint32_t gatewayTypeOverride = UINT32_MAX;
-	std::string confFile = "examples/CrossDC-Algos/config/workload/config-micro.txt";
+	uint32_t bifrostDeploySwitch = UINT32_MAX;
+	std::string confFile = "examples/CrossDC-Algos/config/workload/config-workload.txt";
 	std::string cdfFileName = "examples/CrossDC-Algos/config/workload/Alistorage.txt";
 	// 命令行覆盖项：优先于配置文件中的 TOPOLOGY_FILE / QUERY_FLOW_FILE
 	std::string topologyFileOverride = "";
-	std::string queryFlowFileOverride = "";
 	
 	CommandLine cmd;
 	cmd.AddValue("conf", "config file path", confFile);
@@ -895,12 +886,17 @@ int main(int argc, char *argv[])
 	cmd.AddValue("SPINE_LEAF_CAPACITY", "fallback spine-leaf capacity in Gbps if <1e9, or bps", SPINE_LEAF_CAPACITY);
 	cmd.AddValue("fctOutputFile", "FCT output file path", fct_output_file);
 	cmd.AddValue("pfcOutputFile", "PFC output file path", pfc_output_file);
+	cmd.AddValue("fileFlowFctFile", "File flow FCT output file path", queryFlowFctFile);
 	cmd.AddValue("queryFlowFctFile", "Query flow FCT output file path", queryFlowFctFile);
+	cmd.AddValue("queryFlowFile", "Override QUERY_FLOW_FILE; empty selects generated traffic",
+		Callback<bool, const std::string&>([&](const std::string& value) {
+			queryFlowFileOverride = NormalizeFlowPath(value);
+			return true;
+		}));
 	cmd.AddValue ("algorithm", "specify CC mode. This is added for my convinience. I prefer cmd rather than parsing files.", algorithm);
 	cmd.AddValue("windowCheck", "windowCheck", windowCheck);
 	cmd.AddValue("gatewayType", "Gateway type override, 0 disables gateway, 2 enables ATC gateway", gatewayTypeOverride);
 	cmd.AddValue("topologyFile", "Override TOPOLOGY_FILE in config (priority over config file)", topologyFileOverride);
-	cmd.AddValue("queryFlowFile", "Override QUERY_FLOW_FILE in config (priority over config file)", queryFlowFileOverride);
 
 	cmd.Parse (argc, argv);
 	std::cout << confFile << endl;
@@ -910,10 +906,10 @@ int main(int argc, char *argv[])
 	if (SPINE_LEAF_CAPACITY > 0 && SPINE_LEAF_CAPACITY < LINK_CAPACITY_BASE)
 		SPINE_LEAF_CAPACITY *= LINK_CAPACITY_BASE;
 	if (randomSeed == 0)
-		srand((unsigned)time(NULL));
-	else
-		srand(randomSeed);
+		randomSeed = static_cast<unsigned>(time(NULL));
+	InitializeWorkloadRandomVariables(randomSeed);
 	conf.open(confFile.c_str());
+	NS_ABORT_MSG_IF(!conf.is_open(), "Cannot open configuration: " << confFile);
 	while (!conf.eof())
 	{
 		std::string key;
@@ -1009,12 +1005,8 @@ int main(int argc, char *argv[])
 			topology_file = v;
 			std::cout << "TOPOLOGY_FILE\t\t\t" << topology_file << "\n";
 		}
-		else if (key.compare("FLOW_FILE") == 0)
-		{
-			std::string v;
-			conf >> v;
-			flow_file = v;
-			std::cout << "FLOW_FILE\t\t\t" << flow_file << "\n";
+		else if (key.compare("FLOW_FILE") == 0) {
+			queryFlowFile = ReadOptionalFlowPath(conf);
 		}
 		else if (key.compare("TRACE_FILE") == 0)
 		{
@@ -1127,6 +1119,9 @@ int main(int argc, char *argv[])
 			std::cout << "POWERTCP_DELAY\t\t\t" << (delayWien ? 1 : 0) << "\n";
 		}
 
+		else if (key == "BIFROST_DEPLOY_SWITCH") {
+			conf >> bifrostDeploySwitch;
+		}
 		else if (key.compare("GATEWAY_TYPE") == 0) {
 			conf >> gatewayFlag;
 			std::cout << "GATEWAY_TYPE		" << gatewayFlag << "\n";
@@ -1419,12 +1414,29 @@ int main(int argc, char *argv[])
 			std::cout << "FLOW_LAUNCH_END_TIME\t\t" << FLOW_LAUNCH_END_TIME << '\n';
 		}
 		else if (key.compare("QUERY_FLOW_FILE") == 0) {
-			conf >> queryFlowFile;
-			std::cout << "QUERY_FLOW_FILE		" << queryFlowFile << '\n';
+			configuredQueryFlowFile = ReadOptionalFlowPath(conf);
 		}
-		else if (key.compare("QUERY_AUTO_STOP") == 0) {
+		else if (key == "FILE_FLOW_COUNT") {
+			int64_t value = 0;
+			conf >> value;
+			NS_ABORT_MSG_IF(conf.fail() || value < 0 || value > UINT32_MAX, "FILE_FLOW_COUNT must be a nonnegative 32-bit integer");
+			fileParameters.count = value;
+		}
+		else if (key == "FILE_FLOW_SIZE_BYTES") {
+			conf >> fileParameters.sizeBytes;
+		}
+		else if (key == "FILE_INCAST") {
+			int64_t value = 0;
+			conf >> value;
+			NS_ABORT_MSG_IF(conf.fail() || value <= 0 || value > UINT32_MAX, "FILE_INCAST must be a positive 32-bit integer");
+			fileParameters.incast = value;
+		}
+		else if (key == "FILE_FLOW_START_TIME") {
+			conf >> fileParameters.startTime;
+		}
+		else if (key == "FILE_AUTO_STOP" || key == "QUERY_AUTO_STOP") {
 			conf >> query_auto_stop;
-			std::cout << "QUERY_AUTO_STOP		" << query_auto_stop << '\n';
+			std::cout << key << "		" << query_auto_stop << '\n';
 		}
 		else if (key.compare("FCT_OUTPUT_TEMPLATE") == 0) {
 			std::string ignored;
@@ -1436,29 +1448,27 @@ int main(int argc, char *argv[])
 			conf >> ignored;
 			std::cout << "PFC_OUTPUT_TEMPLATE		" << ignored << '\n';
 		}
-		else if (key.compare("QUERY_FCT_OUTPUT_TEMPLATE") == 0) {
+		else if (key == "FILE_FCT_OUTPUT_TEMPLATE" || key == "QUERY_FCT_OUTPUT_TEMPLATE") {
 			std::string ignored;
 			conf >> ignored;
-			std::cout << "QUERY_FCT_OUTPUT_TEMPLATE	" << ignored << '\n';
+			std::cout << key << "	" << ignored << '\n';
 		}
 		fflush(stdout);
 	}
 	conf.close();
+	queryFlowFile = queryFlowFileOverride.value_or(configuredQueryFlowFile.value_or(queryFlowFile));
+	std::cout << "QUERY_FLOW_FILE\t\t" << (queryFlowFile.empty() ? "<unset>" : queryFlowFile) << '\n';
 	// 命令行参数覆盖配置文件中的拓扑/查询流文件（优先级：命令行 > 配置文件）
 	if (!topologyFileOverride.empty()) {
 		topology_file = topologyFileOverride;
 		std::cout << "TOPOLOGY_FILE_OVERRIDE\t\t" << topology_file << "\n";
-	}
-	if (!queryFlowFileOverride.empty()) {
-		queryFlowFile = queryFlowFileOverride;
-		std::cout << "QUERY_FLOW_FILE_OVERRIDE\t" << queryFlowFile << "\n";
 	}
 	if (gatewayTypeOverride != UINT32_MAX) {
 		gatewayFlag = gatewayTypeOverride;
 		std::cout << "GATEWAY_TYPE_OVERRIDE	" << gatewayFlag << "\n";
 	}
 
-	// Python selects the CC algorithm for each run; workload parameters stay in config-micro.txt.
+	// Python selects the CC algorithm for each run.
 	cc_mode = algorithm; // overrides configuration file
 	has_win = windowCheck; // overrides configuration file
 	var_win = windowCheck; // overrides configuration file
@@ -1470,7 +1480,6 @@ int main(int argc, char *argv[])
 	}
 	
 
-	// workload parameters are owned by config-micro.txt.
 	//simulator_stop_time = END_TIME;
 
 
@@ -1500,12 +1509,12 @@ int main(int argc, char *argv[])
 	}
 
 	topof.open(topology_file.c_str());
-	uint32_t node_num, switch_num, tors, link_num, trace_num;
+	uint32_t node_num, switch_num, tors, link_num;
 	uint32_t long_link_count = 0; // 长链路数目
 	topof >> node_num >> switch_num >> tors >> link_num >> long_link_count; // 读取长链路数目
+	NS_ABORT_MSG_IF(!topof, "Cannot read topology header: " << topology_file);
 	tors = switch_num;
 	std::cout << node_num << " " << switch_num << " " << tors <<  " " << link_num << " " << long_link_count << std::endl;
-	flow_num = 0;
 	
 	// 先读取交换机 ID（第 2 行）
 	std::vector<uint32_t> node_type(node_num, 0);
@@ -1513,6 +1522,7 @@ int main(int argc, char *argv[])
 	for (uint32_t i = 0; i < switch_num; i++) {
 		uint32_t sid;
 		topof >> sid;
+		NS_ABORT_MSG_IF(!topof || sid >= node_num || node_type[sid], "Invalid topology switch at entry " << i);
 		std::cout << "sid " << sid << std::endl;
 		switchNumToId[i] = sid;
 		switchIdToNum[sid] = i;
@@ -1528,6 +1538,7 @@ int main(int argc, char *argv[])
 	for (uint32_t i = 0; i < long_link_count; i++) {
 		uint32_t link_idx;
 		topof >> link_idx;
+		NS_ABORT_MSG_IF(!topof || link_idx >= link_num, "Invalid WAN link index at entry " << i);
 		long_link_indices.insert(link_idx);
 		std::cout << "[TOPOLOGY] Long-distance link index: " << link_idx << std::endl;
 	}
@@ -1597,6 +1608,7 @@ int main(int argc, char *argv[])
 	rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
 
 	FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
+	NS_ABORT_MSG_IF(!pfc_file, "Cannot write PFC results: " << pfc_output_file);
 
 	QbbHelper qbb;
 	Ipv4AddressHelper ipv4;
@@ -1606,6 +1618,7 @@ int main(int argc, char *argv[])
 		std::string data_rate, link_delay;
 		double error_rate;
 		topof >> src >> dst >> data_rate >> link_delay >> error_rate;
+		NS_ABORT_MSG_IF(!topof || src >= node_num || dst >= node_num || src == dst, "Invalid topology link " << i);
 
 		std::cout << src << " " << dst << " " << n.GetN() << " " << data_rate << " " << link_delay << " " << error_rate << std::endl;
 		Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
@@ -1719,6 +1732,14 @@ int main(int argc, char *argv[])
 		nbr2if[dnode][snode].up = true;
 		nbr2if[dnode][snode].delay = DynamicCast<QbbChannel>(DynamicCast<QbbNetDevice>(d.Get(1))->GetChannel())->GetDelay().GetTimeStep();
 		nbr2if[dnode][snode].bw = DynamicCast<QbbNetDevice>(d.Get(1))->GetDataRate().GetBitRate();
+
+		auto& forwardInterfaces = neighborInterfaces[snode][dnode];
+		const auto& forward = nbr2if[snode][dnode];
+		NS_ABORT_MSG_IF(!forwardInterfaces.empty() && (forwardInterfaces.front().bw != forward.bw ||
+		                                               forwardInterfaces.front().delay != forward.delay),
+		                "Parallel links require identical rates and delays");
+		forwardInterfaces.push_back(forward);
+		neighborInterfaces[dnode][snode].push_back(nbr2if[dnode][snode]);
 
 		// setup PFC trace
 		DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
@@ -1867,9 +1888,10 @@ int main(int argc, char *argv[])
 
 #if ENABLE_QP
 	FILE *fct_output = fopen(fct_output_file.c_str(), "w");
+	NS_ABORT_MSG_IF(!fct_output, "Cannot write FCT results: " << fct_output_file);
 	
 	// Open query flow FCT file
-	if (!queryFlowFile.empty()) {
+	{
 		// If not specified, use default based on algorithm
 		if (queryFlowFctFile.empty()) {
 			std::string algo_suffix;
@@ -1880,19 +1902,26 @@ int main(int argc, char *argv[])
 			else if (algorithm == 4) algo_suffix = "powertcp";  // PowerTCP uses ccMode=4
 						
 			else if (algorithm == 7) algo_suffix = "timely";  // Timely is ccMode=7
-			else if (algorithm == 10) algo_suffix = "dctcp";
+			else if (algorithm == 8) algo_suffix = "dctcp";
+			else if (algorithm == 10) algo_suffix = "hpcc-pint";
+			else if (algorithm == 12) algo_suffix = "bifrost";
+			else if (algorithm == 15) algo_suffix = "atc";
 			else if (algorithm == 16) algo_suffix = "dciext";  // DCI-Ext uses ccMode=16
+			else if (algorithm == 17) algo_suffix = "epfc";
 			else if (algorithm == 18) algo_suffix = "grc";
 			else if (algorithm == 19) algo_suffix = "themis";
 			else algo_suffix = "unknown";
-			
-			queryFlowFctFile = "/home/shemuping/newCode/ns3-FRP/results/workload/fct/query-flow-" + algo_suffix + ".txt";
+
+			queryFlowFctFile = "examples/CrossDC-Algos/results/fct/file-flow-" + algo_suffix + ".txt";
 		}
+		auto directory = std::filesystem::path(queryFlowFctFile).parent_path();
+		std::error_code ec;
+		if (!directory.empty()) std::filesystem::create_directories(directory, ec);
 		g_queryFlowFctFile = fopen(queryFlowFctFile.c_str(), "w");
 		if (g_queryFlowFctFile != nullptr) {
-			std::cout << "[QUERY FLOW] Output file: " << queryFlowFctFile << std::endl;
+			std::cout << "[FILE FLOW] Output file: " << queryFlowFctFile << std::endl;
 			// Write header comment
-			fprintf(g_queryFlowFctFile, "# Query Flow FCT Results\n");
+			fprintf(g_queryFlowFctFile, "# File Flow FCT Results\n");
 			fprintf(g_queryFlowFctFile, "# Format: src_node dst_node pg dport flow_size(B) start_time(ns) fct(ns) is_cross_dc\n");
 			fprintf(g_queryFlowFctFile, "# Note: FCT is raw (no compensation) for all flows\n");
 			fflush(g_queryFlowFctFile);
@@ -2101,16 +2130,14 @@ int main(int argc, char *argv[])
 	//
 	// setup switch CC
 	//
+	NS_ABORT_MSG_IF(cc_mode == 12 && bifrostDeploySwitch != UINT32_MAX && !dci_switches.count(bifrostDeploySwitch),
+	                "BIFROST_DEPLOY_SWITCH must identify a DCI switch");
 	for (uint32_t i = 0; i < node_num; i++) {
 		if (n.Get(i)->GetNodeType()) { // switch
 			Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
 
-			// Bifrost (ccMode=12): 在所有DCI交换机上启用周期PFC机制，其他交换机使用ccMode=1 (DCQCN)
-
-
-
 			if (cc_mode == 12) {
-				if (dci_switches.count(i) > 0) {
+				if (dci_switches.count(i) && (bifrostDeploySwitch == UINT32_MAX || i == bifrostDeploySwitch)) {
 					// 从配置文件读取 Bifrost 参数并初始化
 					sw->ReadBifrostConfigFromFile(confFile);
 					sw->InitializeBifrost(i);
@@ -2159,32 +2186,34 @@ int main(int argc, char *argv[])
 	DiscoverWorkloadTopology(SERVER_COUNT, LEAF_COUNT, LEAF_SERVER_CAPACITY, SPINE_LEAF_CAPACITY, SPINE_COUNT);
 	InitializeWorkloadPorts();
 
-	// 生成背景流（CDF）
-	NS_LOG_INFO("Initialize CDF table");
-	struct cdf_table* cdfTable = new cdf_table();
-	init_cdf(cdfTable);
-	load_cdf(cdfTable, cdfFileName.c_str());
-	std::cout << "[WORKLOAD] CDF " << cdfFileName
-	          << " entries " << cdfTable->num_entry
-	          << " avgFlowSize " << avg_cdf(cdfTable) << std::endl;
-
-	// 生成背景流（PER_DC 模式）
-	long flowCount = 0;
-	long totalFlowSize = 0;
-	InstallBackgroundWorkload(load, cdfTable, START_TIME, FLOW_LAUNCH_END_TIME, 
-	                         flowCount, totalFlowSize);
-	std::cout << "[BACKGROUND] Background workload complete. "
-	          << flowCount << " flows, " << totalFlowSize << " bytes total" << std::endl;
-
-	// 生成查询流（文件）
 	long queryFlowCount = 0;
 	long totalQueryFlowSize = 0;
-	InstallQueryFlowFile(queryFlowFile, START_TIME, queryFlowCount, totalQueryFlowSize);
+	std::cout << "[TRAFFIC] foreground=" << (queryFlowFile.empty() ? "generated" : "file")
+	          << " background=" << (load > 0 ? "cdf" : "disabled") << std::endl;
+	if (queryFlowFile.empty())
+		InstallCrossDcFileFlows(fileParameters, FLOW_LAUNCH_END_TIME, queryFlowCount, totalQueryFlowSize);
+	else
+		InstallFixedFlowFile(queryFlowFile, START_TIME, simulator_stop_time, queryFlowCount, totalQueryFlowSize);
 	g_totalQueryFlows = queryFlowCount;
-	std::cout << "[QUERY FLOW] Completion target: " << g_totalQueryFlows << std::endl;
+	std::cout << "[FILE FLOW] Completion target: " << g_totalQueryFlows << std::endl;
+
+	NS_ABORT_MSG_IF(!std::isfinite(load), "Workload load must be finite");
+	load = std::clamp(load, 0.0, 1.0);
+	long flowCount = 0;
+	long totalFlowSize = 0;
+	if (load > 0) {
+		struct cdf_table cdfTable;
+		init_cdf(&cdfTable);
+		NS_ABORT_MSG_IF(!load_cdf(&cdfTable, cdfFileName.c_str()), "Cannot read valid CDF distribution: " << cdfFileName);
+		std::cout << "[WORKLOAD] CDF " << cdfFileName << " entries " << cdfTable.num_entry
+		          << " avgFlowSize " << avg_cdf(&cdfTable) << std::endl;
+		InstallBackgroundWorkload(load, &cdfTable, START_TIME, FLOW_LAUNCH_END_TIME,
+		                          flowCount, totalFlowSize);
+		free_cdf(&cdfTable);
+	}
+	std::cout << "[BACKGROUND] Background workload complete. "
+	          << flowCount << " flows, " << totalFlowSize << " bytes total" << std::endl;
 	std::cout << "[WORKLOAD] Total flows: " << flows.size() << std::endl;
-	free_cdf(cdfTable);
-	delete cdfTable;
 
 	topof.close();
 	tracef.close();
@@ -2220,6 +2249,9 @@ int main(int argc, char *argv[])
 		else if (algorithm == 17) algo_name = "epfc";
 		else if (algorithm == 18) algo_name = "grc";
 		else if (algorithm == 19) algo_name = "themis";
+		else if (algorithm == 8) algo_name = "dctcp";
+		else if (algorithm == 10) algo_name = "hpcc-pint";
+		else if (algorithm == 12) algo_name = "bifrost";
 		else algo_name = "unknown";
 		
 		// 构建文件名: bottleneck_{algo}_{cdf}_load{load}.txt
@@ -2259,6 +2291,6 @@ int main(int argc, char *argv[])
 	// Close query flow FCT file
 	if (g_queryFlowFctFile != nullptr) {
 		fclose(g_queryFlowFctFile);
-		std::cout << "[QUERY FLOW] Closed query flow FCT file: " << queryFlowFctFile << std::endl;
+		std::cout << "[FILE FLOW] Closed file flow FCT file: " << queryFlowFctFile << std::endl;
 	}
 }

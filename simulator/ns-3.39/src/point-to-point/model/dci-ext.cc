@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <iterator>
 
+#include "ns3/abort.h"
+#include "ns3/channel.h"
 #include "ns3/custom-priority-tag.h"
 #include "ns3/ipv4-header.h"
+#include "ns3/node.h"
 #include "ns3/ppp-header.h"
 #include "ns3/qbb-header.h"
 #include "ns3/random-variable.h"
@@ -145,7 +148,7 @@ uint32_t DciExt::LookupN(double ratio) const {
 //     清位后接收方 host 不再生成走 5ms 长链路的慢速 CNP-ACK）
 //   - 0xFA 从长链路来：拦截消费 → 更新表A R_avbl；结算发送速率并按原机制查表调速
 // 接收方 DCI：
-//   - 长链路数据包：建流表（inPort = SenderDC 标识）
+//   - 长链路数据包：建流表（WAN 对端 DCI = SenderDC，inPort 供反馈返回）
 //   - ACK/NACK 来自 DC 内且回程走长链路：per-DIP ACK 差分累计（表一数据源）
 // ---------------------------------------------------------------------------
 bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) {
@@ -294,7 +297,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
 
     // ==================== 接收方 DCI ====================
     if (fromLongLink && ch.l3Prot == 0x11) {
-        // 正向数据包从长链路到达：建流表（受管流集合 + SenderDC 分组依据）
+        // 正向数据包从长链路到达：建表并保留反馈返回端口。
         DciExtFlowKey key(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
         auto inserted = m_rcvFlows.try_emplace(key);
         DciExtRcvFlow &f = inserted.first->second;
@@ -311,7 +314,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
         f.sport = ch.udp.sport;
         f.dport = ch.udp.dport;
         f.pg = (uint8_t)ch.udp.pg;
-        f.inPort = device->GetIfIndex(); // 长链路入端口 = SenderDC 标识
+        f.inPort = device->GetIfIndex(); // 并行口在周期聚合时按对端 DCI 合并。
         f.lastActive = Simulator::Now();
         return false;
     }
@@ -631,8 +634,13 @@ void DciExt::PeriodicTick() {
         double rttSumUs = 0;
         double rttMinUs = 1e18;
         double rttMaxUs = 0;
-        std::map<uint32_t, uint32_t> senderCounts; // inPort -> 流数（表二）
-        std::map<uint32_t, uint32_t> senderSip;    // inPort -> 代表 sip（0xFA 目的地址）
+        struct Sender {
+            uint32_t count = 0;
+            uint32_t sip = 0;
+            uint32_t wanPort = 0;
+        };
+        // All parallel WAN ports to one sender DCI share its per-DIP quota.
+        std::map<uint32_t, Sender> senders; // peer DCI node -> aggregate (table two)
     };
     std::map<uint32_t, Agg> aggs;
     double tSec = m_periodT.GetSeconds();
@@ -653,9 +661,18 @@ void DciExt::PeriodicTick() {
             if (f.rttMinUs < a.rttMinUs) a.rttMinUs = f.rttMinUs;
             if (f.rttMaxUs > a.rttMaxUs) a.rttMaxUs = f.rttMaxUs;
         }
-        a.senderCounts[f.inPort]++;
-        if (a.senderSip[f.inPort] == 0)
-            a.senderSip[f.inPort] = f.sip;
+        NS_ABORT_MSG_IF(m_getDevCb.IsNull(), "DCI-Ext needs WAN devices to identify sender DCs");
+        auto inputDev = m_getDevCb(f.inPort);
+        NS_ABORT_MSG_IF(!IsLongLinkPort(inputDev), "DCI-Ext flow has no WAN ingress");
+        auto channel = inputDev->GetChannel();
+        NS_ABORT_MSG_IF(!channel || channel->GetNDevices() != 2,
+                        "DCI-Ext requires point-to-point WAN links");
+        auto peer = channel->GetDevice(0) == inputDev ? channel->GetDevice(1) : channel->GetDevice(0);
+        auto& sender = a.senders[peer->GetNode()->GetId()];
+        if (sender.count++ == 0) {
+            sender.sip = f.sip;
+            sender.wanPort = f.inPort;
+        }
         f.winAckBytes = 0; // 周期清零
         f.winFirstAckT = Seconds(-1);
         f.winTxBytes = 0;
@@ -765,16 +782,17 @@ void DciExt::PeriodicTick() {
         if (perFlow < kDciExtMinRateBps)
             perFlow = kDciExtMinRateBps;
 
-        for (auto &sc : a.senderCounts) {
+        for (const auto& [senderGateway, sender] : a.senders) {
             // 5. 表二：每 SenderDC 分得 (R_avbl/N) × 该DC流数
-            double rAvblBps = (double)perFlow * sc.second;
-            uint32_t dstIp = a.senderSip[sc.first];
+            // Send one aggregate quota, not one overwriting quota per physical lane.
+            double rAvblBps = (double)perFlow * sender.count;
+            uint32_t dstIp = sender.sip;
             if (m_debug) {
-                printf("[DCIEXT_SEND] %lu node=%u dip=0x%08x sender_port=%u flows=%u rAvbl=%.3fG dst=0x%08x\n",
-                       now.GetTimeStep(), m_nodeId, dip, sc.first, sc.second,
-                       rAvblBps / 1e9, dstIp);
+                printf("[DCIEXT_SEND] %lu node=%u dip=0x%08x sender_port=%u flows=%u rAvbl=%.3fG dst=0x%08x sender_gateway=%u\n",
+                       now.GetTimeStep(), m_nodeId, dip, sender.wanPort, sender.count,
+                       rAvblBps / 1e9, dstIp, senderGateway);
             }
-            SendDipFeedback(dip, dstIp, rAvblBps);
+            SendDipFeedback(dip, dstIp, rAvblBps, sender.wanPort);
         }
     }
 
@@ -830,7 +848,7 @@ void DciExt::SendCnpForFlow(const DciExtFlowKey &key) {
 //   sport/dport = DIP 高/低 16 位，seq = R_avbl（Kbps），目的 IP = 对端活跃流 sip
 //   发送方 DCI 拦截消费；q0 最高优先级保证反馈不被数据队列延迟
 // ---------------------------------------------------------------------------
-void DciExt::SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps) {
+void DciExt::SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps, uint32_t wanPort) {
     qbbHeader seqh;
     seqh.SetSeq((uint32_t)(rAvblBps / 1e3)); // Kbps 编码
     seqh.SetPG(0);
@@ -859,6 +877,13 @@ void DciExt::SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps) {
 
     CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
     newp->PeekHeader(ch);
+    if (wanPort != 0 && !m_getDevCb.IsNull()) {
+        auto device = DynamicCast<QbbNetDevice>(m_getDevCb(wanPort));
+        if (device && device->IsWanPort() && device->IsLinkUp()) {
+            device->SwitchSend(0, newp, ch);
+            return;
+        }
+    }
     if (!m_sendCb.IsNull())
         m_sendCb(newp, ch);
 }

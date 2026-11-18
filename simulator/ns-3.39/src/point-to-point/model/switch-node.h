@@ -20,7 +20,7 @@ class Packet;
 
 // ========== ATC Gateway 配置结构 ==========
 struct AtcConfig {
-    uint32_t voq_max_size = 0;
+    uint32_t voq_max_size = VOQ_MAX_SIZE;
     double cnp_notify_interval_us = 0.0;
     std::string min_rate = "";
     double rate_decrease_interval_us = 0.0;
@@ -183,7 +183,7 @@ public:
 	void EpfcDequeueHelper(uint32_t outPort, Ptr<Packet> p);  // ePFC 出队计量回调：读 Tag 调 DataDequeue（S 口径=物理发出）
 
 	// ========== GRC (ccMode=18) 初始化（仅 DCI） ==========
-	void InitializeGrc(uint32_t dc, const std::map<uint32_t, uint32_t>& routes);
+	void InitializeGrc(uint32_t dc, const std::map<uint32_t, std::vector<uint32_t>>& routes);
 
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);

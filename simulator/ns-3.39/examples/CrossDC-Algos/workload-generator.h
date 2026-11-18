@@ -30,7 +30,14 @@ struct FlowInput {
     double start_time;
     uint32_t idx;
     uint64_t last_recv_bytes;
-    bool is_query_flow;
+    bool is_file_flow;
+};
+
+struct FileFlowParameters {
+    uint32_t count = 0;            // Exact total number of file flows.
+    uint64_t sizeBytes = 300000000; // Bytes per flow, not per incast group.
+    uint32_t incast = 4;           // Distinct senders per group; final group may be smaller.
+    double startTime = 0;
 };
 
 struct WorkloadTopology {
@@ -53,6 +60,12 @@ void DiscoverWorkloadTopology(uint32_t serverCountLimit = 0,
                               uint32_t spineCountFallback = 0);
 
 /**
+ * 初始化独立 ns-3 随机流：背景采样/到达 1000/1001，文件流端点/时间 1002/1003。
+ * randomSeed 设置 ns-3 seed，RngRun 选择重复实验。
+ */
+void InitializeWorkloadRandomVariables(uint32_t randomSeed);
+
+/**
  * 初始化工作负载端口（无参数版本）
  */
 void InitializeWorkloadPorts();
@@ -68,33 +81,44 @@ void AddWorkloadFlow(uint32_t src,
                      long &flowCount,
                      long &totalFlowSize,
                      uint16_t forcedDport = 0,
-                     bool isQueryFlow = false);
+                     bool isFileFlow = false);
 
 /**
- * 安装背景工作负载（PER_DC 模式）
- * @param load 负载率（0.0-1.0）
+ * 按每个 ToR 的实际总上行容量安装 DC 内背景流。
+ * load 表示 ToR 上行 DATA + ACK 负载率（0.0-1.0），使用旧 PowerTCP 的
+ * 包开销估计和跨 ToR 概率校正。各 DC 独立采样，不生成镜像或跨 DC 背景流。
+ * @param load ToR 上行负载率（限制在 0.0-1.0）
  * @param cdfTable CDF 表
  * @param START_TIME 开始时间
  * @param FLOW_LAUNCH_END_TIME 流启动结束时间
  * @param flowCount 流计数器（引用）
  * @param totalFlowSize 总流量（引用）
- * @param refBandwidth 参考带宽（bps），默认 10Gbps
  */
 void InstallBackgroundWorkload(double load,
                                void *cdfTable,
                                double START_TIME,
                                double FLOW_LAUNCH_END_TIME,
                                long &flowCount,
-                               long &totalFlowSize,
-                               uint64_t refBandwidth = 10000000000ULL);
+                               long &totalFlowSize);
 
 /**
- * 从文件加载查询流
+ * 直接生成 A(DC0)/C(DC2) -> B(DC1) 文件流，按 incast 分组随机启动。
  */
-void InstallQueryFlowFile(const std::string& queryFlowFile,
-                          double startTime,
-                          long &queryFlowCount,
-                          long &totalQueryFlowSize);
+void InstallCrossDcFileFlows(const FileFlowParameters& parameters,
+                             double launchEndTime,
+                             long& fileFlowCount,
+                             long& totalFileFlowSize);
+
+// QUERY_FLOW_FILE / --queryFlowFile select this source instead of generated
+// foreground flows. LOAD independently controls the CDF background.
+void InstallFixedFlowFile(const std::string& path,
+                          double startOffset,
+                          double stopTime,
+                          long& flowCount,
+                          long& totalFlowSize);
+
+const FlowInput* FindFileFlow(uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport);
+const std::vector<uint32_t>& GetFileFlowIndices();
 
 // ==================== 工具函数 ====================
 

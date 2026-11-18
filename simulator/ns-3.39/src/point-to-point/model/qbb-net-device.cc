@@ -304,6 +304,7 @@ void
 QbbNetDevice::DoDispose()
 {
 	NS_LOG_FUNCTION(this);
+	for (auto& resume : m_bifrostResume) Simulator::Cancel(resume);
 	if (!m_nextSend.IsExpired()) Simulator::Remove(m_nextSend);
 	m_nextSend = EventId();
 	m_rdmaReceiveCb.Nullify();
@@ -713,6 +714,8 @@ bool QbbNetDevice::SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader
 }
 
 void QbbNetDevice::SendPfc(uint32_t qIndex, uint32_t type) {
+	m_sentPfcPause[qIndex] = type == 0;
+	if (type != 0 && m_bifrostResume[qIndex].IsRunning()) return;
 	Ptr<Packet> p = Create<Packet>(0);
 	PauseHeader pauseh((type == 0 ? m_pausetime : 0), m_queue->GetNBytes(qIndex), qIndex);
 	p->AddHeader(pauseh);
@@ -733,6 +736,16 @@ void QbbNetDevice::SendPfc(uint32_t qIndex, uint32_t type) {
 
 // ========== Bifrost: 自定义暂停时间的PFC发送 ==========
 void QbbNetDevice::SendPfcWithTime(uint32_t qIndex, uint32_t type, uint32_t customTime) {
+	auto& resume = m_bifrostResume[qIndex];
+	if (type != 0 || customTime == 0) {
+		if (resume.IsRunning()) {
+			Simulator::Cancel(resume);
+			FinishBifrostPause(qIndex);
+		}
+		return;
+	}
+	Simulator::Cancel(resume);
+	resume = Simulator::Schedule(MicroSeconds(customTime), &QbbNetDevice::FinishBifrostPause, this, qIndex);
 	Ptr<Packet> p = Create<Packet>(0);
 	// 关键区别:使用传入的customTime而非m_pausetime
 	PauseHeader pauseh((type == 0 ? customTime : 0), m_queue->GetNBytes(qIndex), qIndex);
@@ -750,6 +763,11 @@ void QbbNetDevice::SendPfcWithTime(uint32_t qIndex, uint32_t type, uint32_t cust
 	p->PeekHeader(ch);
 	m_tracePfc(type+2); // 2 indicates PFC PAUSE sent.3 indicates RESUME sent
 	SwitchSend(0, p, ch);
+}
+
+void QbbNetDevice::FinishBifrostPause(uint32_t qIndex) {
+	if (!m_sentPfcPause[qIndex] && IsLinkUp())
+		SendPfc(qIndex, 1);
 }
 
 bool

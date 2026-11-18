@@ -35,7 +35,7 @@ struct DciExtRcvFlow {
     uint32_t sip, dip;
     uint16_t sport, dport;
     uint8_t pg;
-    uint32_t inPort;         // 长链路入端口（ifIndex）= SenderDC 标识
+    uint32_t inPort;         // 长链路入端口；SenderDC 按对端 DCI 分组，合并并行口
     uint32_t ackWatermark;   // ACK 累计确认水位（全局累计，差分进 winAckBytes）
     uint64_t txWatermark;    // 曾从本 DCI 发出的最高字节边界，老化后保留
     uint64_t winAckBytes;    // 本周期 ACK 确认字节（DIP ACK 反馈速率口径）
@@ -136,7 +136,8 @@ public:
     void PeriodicTick();                            // 接收方周期 T：聚合表一/二 + 发 0xFA
     void SndTick();                                 // 发送方周期 T：首调后，每 T 结算并控制
     void SendCnpForFlow(const DciExtFlowKey &key);  // 构造并发出 1 个 CNP
-    void SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps); // 0xFA 反馈
+    void SendDipFeedback(uint32_t dip, uint32_t dstIp, double rAvblBps,
+                          uint32_t wanPort = 0); // 0xFA 反馈
     void BurstTick(DciExtFlowKey key);              // 连发定时器回调
     uint32_t LookupN(double ratio) const;
     double ComputeV(DciExtSndDip &e, double tSec);  // 原配额调整：首个跨域 RTT 前为 P，之后为 0.9P

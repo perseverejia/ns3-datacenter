@@ -81,7 +81,8 @@ public:
 
 class IntHeader{
 public:
-	static const uint32_t maxHop = 5;
+	// The 3DC chain can traverse ToR-Spine-DCI-DCI-DCI-Spine-ToR.
+	static const uint32_t maxHop = 8;
 	enum Mode{
 		NORMAL = 0,
 		TS = 1,

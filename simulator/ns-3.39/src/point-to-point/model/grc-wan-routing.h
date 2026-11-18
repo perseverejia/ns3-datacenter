@@ -11,6 +11,7 @@
 #include <deque>
 #include <map>
 #include <random>
+#include <tuple>
 #include <vector>
 
 namespace ns3
@@ -23,7 +24,8 @@ class GrcWanRouting : public Object
 
   public:
     GrcWanRouting();
-    void Init(Ptr<Node> node, uint32_t dc, const std::map<uint32_t, uint32_t>& routes);
+    void Init(Ptr<Node> node, uint32_t dc,
+              const std::map<uint32_t, std::vector<uint32_t>>& routes);
     void RouteInput(Ptr<Packet> p, CustomHeader& ch);
 
     typedef Callback<void, Ptr<Packet>, CustomHeader&> SwitchSendToDevCallback;
@@ -33,7 +35,7 @@ class GrcWanRouting : public Object
     SwitchSendToDevCallback m_switchSendToDevCallback; // SwitchNode::SendToDev
     uint32_t m_switch_id = 0;
     uint32_t m_dc = 0;
-    std::mt19937 m_rng; // Per-DCI randomness, independent of the workload's rand().
+    std::mt19937 m_rng; // Per-DCI randomness, independent of workload random streams.
     uint32_t m_hash_seed1 = 0, m_hash_seed2 = 0;
     void HandleUdpReceived(Ptr<Packet> p, CustomHeader& ch);
     void HandleAckReceived(Ptr<Packet> p, CustomHeader& ch);
@@ -41,10 +43,18 @@ class GrcWanRouting : public Object
     /************数据平面延迟检测*********/
     static const inline int rtt_table_size = 64 * 16;
 
+    using RttFlow = std::tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint16_t>;
+    // Keep one byte frontier per WAN QP independent of sampling-slot eviction.
+    std::map<RttFlow, uint32_t> m_highestSentEnd;
+
+    void TrackRttSend(const CustomHeader& ch, uint32_t seqEnd);
+    void ForgetFlow(Ptr<RdmaQueuePair> qp);
+
     struct RttEntry
     {
         bool valid = false;
-        uint32_t hashed_seq = 0;
+        RttFlow flow;
+        uint32_t seqEnd = 0;
         Time timestamp = Seconds(0);
     } rtt_table[rtt_table_size];
     Time m_rtt_entry_timeout;
@@ -64,6 +74,7 @@ class GrcWanRouting : public Object
         // Per-epoch RTT samples and a time-bounded minimum of epoch averages.
         Time rtt_sum = Seconds(0);
         int rtt_num = 0;
+        Time epoch_min_sample;
         void record_rtt(Time rtt, Time rto);
         Time base_rtt_window = Seconds(10);
         std::deque<std::pair<Time, Time>> base_rtt_minima;
@@ -106,11 +117,6 @@ class GrcWanRouting : public Object
 
     std::map<uint32_t, DstDCHandler> m_dcHandler;
     uint32_t Hash4Tuple(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport);
-    uint32_t Hash4TupleSeq(uint32_t sip,
-                           uint32_t dip,
-                           uint16_t sport,
-                           uint16_t dport,
-                           uint32_t seq);
     uint32_t GetRttTableIndex(uint32_t sip,
                               uint32_t dip,
                               uint16_t sport,

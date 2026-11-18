@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 crossDC workload algorithm runner script.
-Workload parameters live in simulator/ns-3.39/examples/CrossDC-Algos/config/workload/config-micro.txt.
+Workload parameters live in simulator/ns-3.39/examples/CrossDC-Algos/config/workload/config-workload.txt.
 Specify only the algorithm here, for example:
     python3 run_single_workload_algo.py 13 FRP
 """
@@ -19,26 +19,26 @@ import numpy as np
 
 def parse_dcqcn_queue_record(line):
     """Return a complete numeric queue record; skip concatenated or truncated lines."""
-    match = re.fullmatch(r"\[DCQCN_QLEN\]\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", line.strip())
+    match = re.fullmatch(r"\[DCQCN_QLEN\]\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+mmu_eg=\d+)?", line.strip())
     if match is None:
         return None
     stamp, switch, port, size = map(int, match.groups())
     return switch, port, stamp / 1e6, size / 1000.0
 
 
-def analyze_query_flow_fct(query_fct_file):
-    """Analyze query flow FCT and print statistics."""
-    if not os.path.exists(query_fct_file):
-        print(f"Query flow FCT file not found: {query_fct_file}")
+def analyze_file_flow_fct(file_fct_file, expected_count=None):
+    """Analyze file flow FCT and print statistics."""
+    if not os.path.exists(file_fct_file):
+        print(f"File flow FCT file not found: {file_fct_file}")
         return
 
     print(f"\n{'='*80}")
-    print("Query Flow FCT Analysis")
+    print("File Flow FCT Analysis")
     print(f"{'='*80}")
-    print(f"File: {query_fct_file}\n")
+    print(f"File: {file_fct_file}\n")
 
     flows = []
-    with open(query_fct_file, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_fct_file, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if line.startswith("#"):
                 continue
@@ -55,11 +55,14 @@ def analyze_query_flow_fct(query_fct_file):
                     "is_cross_dc": int(parts[7]),
                 })
 
+    if expected_count is not None:
+        print(f"Planned file flows: {expected_count}; completed: {len(flows)}; "
+              f"incomplete: {max(0, expected_count - len(flows))}")
     if not flows:
-        print("No query flows found!")
+        print("No file flows found!")
         return
 
-    print(f"{'No.':<6} {'Src':<8} {'Dst':<8} {'PG':<6} {'Dport':<8} {'Size(MB)':<10} {'Start(ms)':<12} {'FCT(ms)':<12} {'Cross-DC':<10}")
+    print(f"{'No.':<6} {'Src':<8} {'Dst':<8} {'PG':<6} {'Dport':<8} {'Size(MiB)':<10} {'Start(ms)':<12} {'FCT(ms)':<12} {'Cross-DC':<10}")
     print("=" * 80)
 
     for idx, flow in enumerate(flows, 1):
@@ -77,7 +80,7 @@ def analyze_query_flow_fct(query_fct_file):
     intra_dc_flows = [f for f in flows if f["is_cross_dc"] == 0]
 
     print("\nStatistics:")
-    print(f"  Total query flows: {len(flows)}")
+    print(f"  Total file flows: {len(flows)}")
     print(f"  Cross-DC flows: {len(cross_dc_flows)}")
     print(f"  Intra-DC flows: {len(intra_dc_flows)}")
     print(f"\n  Average FCT: {np.mean(fct_values):.3f} ms")
@@ -103,7 +106,7 @@ def analyze_query_flow_fct(query_fct_file):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CROSSDC_ALGOS_DIR = os.path.dirname(SCRIPT_DIR)  # examples/CrossDC-Algos
 NS3_DIR = os.path.dirname(os.path.dirname(CROSSDC_ALGOS_DIR))  # ns-3.39
-CONFIG_FILE = "examples/CrossDC-Algos/config/workload/config-micro.txt"
+CONFIG_FILE = "examples/CrossDC-Algos/config/workload/config-workload.txt"
 DUMP_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results/dump")
 RESULTS_DIR = os.path.join(CROSSDC_ALGOS_DIR, "results")
 FCT_DIR = os.path.join(RESULTS_DIR, "fct")
@@ -125,7 +128,7 @@ def load_tag(value):
 
 
 def read_config_value(content, key, default=None):
-    pattern = rf"^\s*{re.escape(key)}\s+(\S+)"
+    pattern = rf"^[^\S\n]*{re.escape(key)}[^\S\n]+([^\s#]+)"
     match = re.search(pattern, content, re.MULTILINE)
     return match.group(1) if match else default
 
@@ -142,38 +145,11 @@ def resolve_ns3_path(path):
     return os.path.join(NS3_DIR, path)
 
 
-def load_query_flow_keys(query_flow_file):
-    """Return {(src, dst, dport)} for query flows."""
-    keys = set()
-    if not query_flow_file:
-        return keys
-
-    path = resolve_ns3_path(query_flow_file)
-    if not os.path.exists(path):
-        print(f"Warning: query flow file not found, throughput plot will be empty: {path}")
-        return keys
-
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        first = True
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if first:
-                first = False
-                if len(parts) == 1:
-                    continue
-            if len(parts) < 6:
-                continue
-            try:
-                src = int(parts[0])
-                dst = int(parts[1])
-                dport = int(parts[3])
-            except ValueError:
-                continue
-            keys.add((src, dst, dport))
-    return keys
+def load_file_flow_keys(lines):
+    """Identify generated or explicitly loaded flows from simulator metadata."""
+    pattern = re.compile(r"\[FILE FLOW #\d+\] src=(\d+) dst=(\d+) pg=\d+ sport=(\d+) dport=(\d+)")
+    return {tuple(map(int, match.groups())) for line in lines
+            if (match := pattern.search(line))}
 
 
 def parse_ip_to_node_map(lines):
@@ -191,8 +167,8 @@ def parse_ip_to_node_map(lines):
     return ip_to_node
 
 
-def parse_tx_rate(lines, ip_to_node, query_flow_keys):
-    """Return periodic send-side rates for query flows, in ms and Gbps."""
+def parse_tx_rate(lines, ip_to_node, file_flow_keys):
+    """Return periodic send-side rates for file flows, in ms and Gbps."""
     tx_rates = {}
     pattern = re.compile(
         r"\[TX RATE\] Host (\d+) sip (\d+) dip (\d+) sport (\d+) dport (\d+) "
@@ -208,17 +184,17 @@ def parse_tx_rate(lines, ip_to_node, query_flow_keys):
         if dst_node is None:
             continue
         dport = int(dport)
-        if (src_node, dst_node, dport) not in query_flow_keys:
-            continue
         key = (src_node, dst_node, int(sport), dport)
+        if key not in file_flow_keys:
+            continue
         data = tx_rates.setdefault(key, {"times": [], "rates": []})
         data["times"].append(int(time_ns) / 1e6)
         data["rates"].append(float(rate_bps) / 1e9)
     return tx_rates
 
 
-def parse_cnp_events(lines, ip_to_node, query_flow_keys):
-    """Return {flow_key: [CNP receive time in ms]} for query flows."""
+def parse_cnp_events(lines, ip_to_node, file_flow_keys):
+    """Return {flow_key: [CNP receive time in ms]} for file flows."""
     cnp_events = {}
     pattern = re.compile(
         r"\[DCQCN_CNP\]\s+([\d.]+)ms node=(\d+) cnp_received "
@@ -235,7 +211,7 @@ def parse_cnp_events(lines, ip_to_node, query_flow_keys):
         if dst_node is None:
             continue
         flow_key = (src_node, dst_node, int(sport), int(dport))
-        if (src_node, dst_node, int(dport)) not in query_flow_keys:
+        if flow_key not in file_flow_keys:
             continue
         cnp_events.setdefault(flow_key, []).append(float(time_ms))
     return cnp_events
@@ -390,7 +366,7 @@ def map_pfc_events_to_flows(pfc_events, port_map, adj, flow_keys):
 
 
 def plot_tx_rate(tx_rates, cnp_events, pfc_events_by_flow, output_path, algo_name, cc_mode, load):
-    """Save one TX-rate subplot per query flow, with CNP and PFC markers."""
+    """Save one TX-rate subplot per file flow, with CNP and PFC markers."""
     plt.rcParams["font.family"] = "DejaVu Sans"
     plt.rcParams["axes.unicode_minus"] = False
     colors = ["red", "blue", "green", "orange", "purple", "cyan", "lime", "brown",
@@ -492,22 +468,16 @@ def run_and_plot(args):
         "PFC_OUTPUT_TEMPLATE",
         os.path.join(PFC_DIR, "pfc_{suffix}.txt"),
     )
-    query_template = read_config_value(
+    file_template = read_config_value(
         content,
-        "QUERY_FCT_OUTPUT_TEMPLATE",
-        os.path.join(FCT_DIR, "query-flow-{suffix}.txt"),
+        "FILE_FCT_OUTPUT_TEMPLATE",
+        read_config_value(content, "QUERY_FCT_OUTPUT_TEMPLATE",
+                          os.path.join(FCT_DIR, "file-flow-{suffix}.txt")),
     )
-    query_flow_file = read_config_value(content, "QUERY_FLOW_FILE", "")
-    # 命令行覆盖：同步 Python 侧使用的查询流文件（用于绘图时识别查询流）
-    if args.query_flow:
-        query_flow_file = args.query_flow
-    query_flow_keys = load_query_flow_keys(query_flow_file)
-    # print(f"Loaded {len(query_flow_keys)} query flow definitions for throughput plotting.")
-
     fct_out = resolve_output_path(render_template(fct_template, suffix, args, load))
     pfc_out = resolve_output_path(render_template(pfc_template, suffix, args, load))
-    query_fct_out = resolve_output_path(render_template(query_template, suffix, args, load))
-    for path in (fct_out, pfc_out, query_fct_out):
+    file_fct_out = resolve_output_path(render_template(file_template, suffix, args, load))
+    for path in (fct_out, pfc_out, file_fct_out):
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     config = CONFIG_FILE
@@ -529,15 +499,15 @@ def run_and_plot(args):
             f"--randomSeed={args.randomSeed}",
             f"--fctOutputFile={fct_out}",
             f"--pfcOutputFile={pfc_out}",
-            f"--queryFlowFctFile={query_fct_out}",
+            f"--fileFlowFctFile={file_fct_out}",
         ]
-        # 命令行覆盖拓扑/查询流文件（优先于配置文件）
+        # 命令行覆盖拓扑文件（优先于配置文件）
         if args.topology:
             cmd.append(f"--topologyFile={args.topology}")
             print(f"Topology override: {args.topology}")
-        if args.query_flow:
+        if args.query_flow is not None:
             cmd.append(f"--queryFlowFile={args.query_flow}")
-            print(f"Query flow override: {args.query_flow}")
+            print(f"Query flow override: {args.query_flow or '<unset>'}")
 
         print("Running workload simulation...")
         with open(log_file, "a", encoding="utf-8") as log:
@@ -548,30 +518,33 @@ def run_and_plot(args):
         print(f"Simulation complete ({log_size/1024:.1f}KB)\n")
 
         print("Parsing log...")
-        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        def log_lines():
+            with open(log_file, encoding="utf-8", errors="replace") as f:
+                yield from f
+
+        file_flow_keys = load_file_flow_keys(log_lines())
 
         all_queue_data = {}
         flow_tp = {}
         workload_lines = []
-        totals = {"flow": None, "query": None, "background": None}
+        totals = {"flow": None, "file": None, "background": None}
 
-        for line in lines:
+        for line in log_lines():
             line = line.strip()
-            if "[WORKLOAD]" in line or "[WORKLOAD LEAF]" in line:
+            if "[WORKLOAD]" in line or "[WORKLOAD TOR]" in line:
                 workload_lines.append(line)
 
             m = re.search(r"Total flows?:\s+(\d+)", line, re.IGNORECASE)
             if m:
                 totals["flow"] = int(m.group(1))
-            m = re.search(r"Total Query:\s+(\d+)", line)
+            m = re.search(r"\[FILE FLOW\] Generated (\d+) flows", line)
             if m:
-                totals["query"] = int(m.group(1))
-            m = re.search(r"Total background flows?:\s+(\d+)", line, re.IGNORECASE)
+                totals["file"] = int(m.group(1))
+            m = re.search(r"\[BACKGROUND\].*? (\d+) flows,", line, re.IGNORECASE)
             if m:
                 totals["background"] = int(m.group(1))
 
-            if "[DCQCN_QLEN]" in line and args.ccMode in (1, 3, 7, 15, 16, 17, 18, 19):
+            if "[DCQCN_QLEN]" in line and args.ccMode not in (13, 14):
                 # ccMode=15 (ATC) / ccMode=16 (DCI-Ext) / ccMode=17 (ePFC) / ccMode=18 (GRC) 队列监控走同一 [DCQCN_QLEN] 输出（switch-node.cc 按交换机监控打印，与 cc_mode 无关）
                 record = parse_dcqcn_queue_record(line)
                 if record is not None:
@@ -599,9 +572,9 @@ def run_and_plot(args):
                 dst = int(m.group(2))
                 sport = int(m.group(4))
                 dport = int(m.group(5))
-                if (src, dst, dport) not in query_flow_keys:
-                    continue
                 key = (src, dst, sport, dport)
+                if key not in file_flow_keys:
+                    continue
                 flow_tp.setdefault(key, {"times": [], "rates": []})
                 flow_tp[key]["times"].append(float(m.group(7)) * 1000)
                 flow_tp[key]["rates"].append(float(m.group(6)) / 1e9)
@@ -628,9 +601,9 @@ def run_and_plot(args):
         if top_congestion:
             top_desc = ", ".join([f"SW{cp['switch']}p{cp['port']}(avg={cp['avg_q_kb']:.0f}KB)"
                                   for cp in top_congestion[:3]])
-            print(f"Parse complete: {len(all_queue_data)} switch-port pairs monitored, top bottlenecks: {top_desc}, query receiver-side flows {len(active_flows)}")
+            print(f"Parse complete: {len(all_queue_data)} switch-port pairs monitored, top bottlenecks: {top_desc}, file receiver-side flows {len(active_flows)}")
         else:
-            print(f"Parse complete: {len(all_queue_data)} switch-port pairs, query receiver-side flows {len(active_flows)}")
+            print(f"Parse complete: {len(all_queue_data)} switch-port pairs, file receiver-side flows {len(active_flows)}")
 
         print("Generating plots...")
         plt.rcParams["font.family"] = "DejaVu Sans"
@@ -643,7 +616,7 @@ def run_and_plot(args):
                      fontsize=18, fontweight="bold")
 
         ax2 = axes[0]
-        print(f"Plotting receiver throughput for {len(active_flows)} query flows...")
+        print(f"Plotting receiver throughput for {len(active_flows)} file flows...")
         for idx, key in enumerate(active_flows):
             times = flow_tp[key]["times"]
             rates = flow_tp[key]["rates"]
@@ -652,9 +625,9 @@ def run_and_plot(args):
                 continue
             ax2.plot(times[:n], rates[:n],
                      color=colors[idx % len(colors)], lw=2,
-                     label=f"Query {key[0]}->{key[1]} (dp={key[3]})", alpha=0.85)
+                     label=f"File {key[0]}->{key[1]} (dp={key[3]})", alpha=0.85)
         ax2.set_ylabel("Receive Throughput (Gbps)", fontsize=14, fontweight="bold")
-        ax2.set_title(f"RX Throughput - query flows ({len(active_flows)} flows)", fontsize=15, fontweight="bold")
+        ax2.set_title(f"RX Throughput - file flows ({len(active_flows)} flows)", fontsize=15, fontweight="bold")
         ax2.legend(loc="upper right", fontsize=10, ncol=3, framealpha=0.9)
         ax2.grid(True, alpha=0.3, linestyle="--")
         ax2.set_ylim(bottom=0)
@@ -683,9 +656,9 @@ def run_and_plot(args):
         plt.close(fig)
         print(f"Plot saved: {output_file}\n")
 
-        ip_to_node = parse_ip_to_node_map(lines)
-        tx_rates = parse_tx_rate(lines, ip_to_node, query_flow_keys)
-        cnp_events = parse_cnp_events(lines, ip_to_node, query_flow_keys)
+        ip_to_node = parse_ip_to_node_map(log_lines())
+        tx_rates = parse_tx_rate(log_lines(), ip_to_node, file_flow_keys)
+        cnp_events = parse_cnp_events(log_lines(), ip_to_node, file_flow_keys)
         # PFC 事件解析与受影响流映射（基于拓扑端口映射 + 最短路径）
         pfc_events = parse_pfc_events(pfc_out)
         topo_for_map = args.topology or read_config_value(content, "TOPOLOGY_FILE", "")
@@ -699,10 +672,11 @@ def run_and_plot(args):
         if tx_rates:
             plot_tx_rate(tx_rates, cnp_events, pfc_by_flow, tx_rate_output_file, args.algo_name, args.ccMode, load)
         else:
-            print("Warning: no query-flow TX RATE data was parsed; skipping TX RATE plot. "
+            print("Warning: no file-flow TX RATE data was parsed; skipping TX RATE plot. "
                   "Check that periodic TX-rate sampling and routing-table audit logs are enabled.")
 
         fct_ns = []
+        background_fct_ns = []
         if os.path.exists(fct_out):
             with open(fct_out, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -710,16 +684,19 @@ def run_and_plot(args):
                     if len(parts) < 7:
                         continue
                     try:
-                        fct_ns.append(float(parts[6]))
+                        value = float(parts[6])
+                        fct_ns.append(value)
+                        if len(parts) >= 9 and parts[8] == "0":
+                            background_fct_ns.append(value)
                     except ValueError:
                         continue
 
         print(f"{'='*80}")
         print(f"Statistics - {args.algo_name}")
         print(f"{'='*80}")
-        print(f"Total background flow: {totals['background']}  Total flow: {totals['flow']}  Total Query: {totals['query']}")
+        print(f"Total background flow: {totals['background']}  Total flow: {totals['flow']}  Total File: {totals['file']}")
         print(f"Discovered info/load lines: {len(workload_lines)}")
-        print(f"Active query flow count: {len(active_flows)}")
+        print(f"Active file flow count: {len(active_flows)}")
         print(f"\n{'='*80}")
         print("Congestion Point Detection (auto-identified by avg queue length)")
         print(f"{'='*80}")
@@ -737,6 +714,10 @@ def run_and_plot(args):
             print(f"\nFCT stats: completed flows={len(fct_ms)} avg completion time={np.mean(fct_ms):.6f} ms P99 completion time={np.percentile(fct_ms, 99):.6f} ms")
         else:
             print("\nFCT stats: No completed flow data")
+        if background_fct_ns:
+            background_ms = np.array(background_fct_ns) / 1e6
+            print(f"Background FCT: completed={len(background_ms)} "
+                  f"avg={np.mean(background_ms):.6f} ms P99={np.percentile(background_ms, 99):.6f} ms")
         print(f"Log: {log_file}")
         print(f"FCT: {fct_out}")
         print(f"PFC: {pfc_out}")
@@ -769,7 +750,7 @@ def run_and_plot(args):
             print(f"PFC stats: PAUSE=0  RESUME=0 (no events)")
         # ePFC (ccMode=17) 事件统计：打标 / CCF 生成与边缘建表 / 边缘暂停恢复
         epfc_stats = {}
-        for line in lines:
+        for line in log_lines():
             m2 = re.search(r"\[EPFC_(XOFF|XON|MARK|CCF_GEN|CCF_EDGE)\]", line)
             if m2:
                 epfc_stats[m2.group(1)] = epfc_stats.get(m2.group(1), 0) + 1
@@ -780,8 +761,8 @@ def run_and_plot(args):
         if tx_rates:
             print(f"TX RATE image file: {tx_rate_output_file}")
 
-        if os.path.exists(query_fct_out):
-            analyze_query_flow_fct(query_fct_out)
+        if os.path.exists(file_fct_out):
+            analyze_file_flow_fct(file_fct_out, len(file_flow_keys))
 
         # 写入分析数据到文件
         os.makedirs(ANALYSIS_DIR, exist_ok=True)
@@ -790,8 +771,8 @@ def run_and_plot(args):
             af.write(f"{'='*80}\n")
             af.write(f"Statistics - {args.algo_name} (ccMode={args.ccMode})\n")
             af.write(f"{'='*80}\n")
-            af.write(f"Total background flow: {totals['background']}  Total flow: {totals['flow']}  Total Query: {totals['query']}\n")
-            af.write(f"Active query flow count: {len(active_flows)}\n\n")
+            af.write(f"Total background flow: {totals['background']}  Total flow: {totals['flow']}  Total File: {totals['file']}\n")
+            af.write(f"Active file flow count: {len(active_flows)}\n\n")
             
             # 拥塞点检测
             af.write(f"{'='*80}\n")
@@ -850,19 +831,19 @@ def run_and_plot(args):
             else:
                 af.write("PAUSE: 0  RESUME: 0 (no events)\n")
             
-            # Query 流分析
+            # File 流分析
             af.write(f"\n{'='*80}\n")
-            af.write("Query Flow FCT Analysis\n")
+            af.write("File Flow FCT Analysis\n")
             af.write(f"{'='*80}\n")
-            if os.path.exists(query_fct_out):
-                query_flows = []
-                with open(query_fct_out, "r", encoding="utf-8", errors="replace") as qf:
+            if os.path.exists(file_fct_out):
+                file_flows = []
+                with open(file_fct_out, "r", encoding="utf-8", errors="replace") as qf:
                     for line in qf:
                         if line.startswith("#"):
                             continue
                         parts = line.strip().split()
                         if len(parts) >= 8:
-                            query_flows.append({
+                            file_flows.append({
                                 "src": int(parts[0]),
                                 "dst": int(parts[1]),
                                 "size": int(parts[4]),
@@ -870,15 +851,15 @@ def run_and_plot(args):
                                 "is_cross_dc": int(parts[7]),
                             })
                 
-                if query_flows:
-                    cross_dc_flows = [f for f in query_flows if f["is_cross_dc"] == 1]
-                    intra_dc_flows = [f for f in query_flows if f["is_cross_dc"] == 0]
+                if file_flows:
+                    cross_dc_flows = [f for f in file_flows if f["is_cross_dc"] == 1]
+                    intra_dc_flows = [f for f in file_flows if f["is_cross_dc"] == 0]
                     
-                    af.write(f"Total query flows: {len(query_flows)}\n")
+                    af.write(f"Total file flows: {len(file_flows)}\n")
                     af.write(f"Cross-DC flows: {len(cross_dc_flows)}\n")
                     af.write(f"Intra-DC flows: {len(intra_dc_flows)}\n\n")
                     
-                    all_fct = np.array([f["fct_ns"] / 1e6 for f in query_flows])
+                    all_fct = np.array([f["fct_ns"] / 1e6 for f in file_flows])
                     af.write(f"Overall FCT: avg={np.mean(all_fct):.3f} ms, min={np.min(all_fct):.3f} ms, max={np.max(all_fct):.3f} ms\n")
                     af.write(f"P50={np.percentile(all_fct, 50):.3f} ms, P95={np.percentile(all_fct, 95):.3f} ms, P99={np.percentile(all_fct, 99):.3f} ms\n\n")
                     
@@ -893,9 +874,9 @@ def run_and_plot(args):
                         ratio = np.mean(cross_fct) / np.mean(intra_fct) if np.mean(intra_fct) > 0 else 0
                         af.write(f"\nCross-DC / Intra-DC FCT ratio: {ratio:.1f}x\n")
                 else:
-                    af.write("No query flow data\n")
+                    af.write("No file flow data\n")
             else:
-                af.write("Query flow FCT file not found\n")
+                af.write("File flow FCT file not found\n")
             
             af.write(f"\n{'='*80}\n")
         
@@ -939,14 +920,14 @@ Examples:
     parser.add_argument("algo_name", type=str, help="Algorithm name (e.g., DCQCN, FRP, ROCC)")
     parser.add_argument("--randomSeed", type=int, default=7,
                         help="Random seed (default: 7)")
-    parser.add_argument("--timeout", type=int, default=180,
-                        help="Timeout in seconds (default: 180 = 3 minutes)")
+    parser.add_argument("--timeout", type=int,
+                        help="Simulation timeout in seconds (default: no timeout)")
     parser.add_argument("--config", type=str, default=None,
-                        help="Config file path relative to ns-3.39 (default: config-micro.txt)")
+                        help="Config file path relative to ns-3.39 (default: config-workload.txt)")
     parser.add_argument("--topology", type=str, default=None,
                         help="Override TOPOLOGY_FILE in config (relative to ns-3.39)")
-    parser.add_argument("--query-flow", type=str, default=None,
-                        help="Override QUERY_FLOW_FILE in config (relative to ns-3.39)")
+    parser.add_argument("--query-flow", "--queryFlowFile", dest="query_flow", default=None,
+                        help="Override QUERY_FLOW_FILE; an empty value selects generated traffic")
     args = parser.parse_args()
 
     if args.config:

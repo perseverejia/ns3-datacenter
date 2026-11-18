@@ -33,7 +33,7 @@ void init_cdf(struct cdf_table *table);
 void free_cdf(struct cdf_table *table);
 
 /* get CDF distribution from a given file */
-void load_cdf(struct cdf_table *table, const char *file_name);
+int load_cdf(struct cdf_table *table, const char *file_name);
 
 /* print CDF distribution information */
 void print_cdf(struct cdf_table *table);
@@ -43,6 +43,9 @@ double avg_cdf(struct cdf_table *table);
 
 /* Generate a random value based on CDF distribution */
 double gen_random_cdf(struct cdf_table *table);
+
+/* Sample a supplied quantile, allowing callers to use ns-3 random streams. */
+double gen_value_cdf(struct cdf_table *table, double quantile);
 
 #ifdef __cplusplus
 }

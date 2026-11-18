@@ -148,7 +148,7 @@ SwitchNode::SwitchNode() {
 	m_epfc.SetGateCallback(MakeCallback(&SwitchNode::EpfcGateHelper, this));
 }
 
-void SwitchNode::InitializeGrc(uint32_t dc, const std::map<uint32_t, uint32_t>& routes) {
+void SwitchNode::InitializeGrc(uint32_t dc, const std::map<uint32_t, std::vector<uint32_t>>& routes) {
 	if (m_ccMode != 18) return;
 	NS_ABORT_MSG_IF(!GrcSettings::enabled || m_grc, "GRC must be configured once before initialization");
 	m_grc = CreateObject<GrcWanRouting>();
@@ -486,6 +486,8 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 		if (buf[PppHeader::GetStaticSize() + 9] == 0x11) { // udp packet
 			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 6]; // ppp, ip, udp, SeqTs, INT
 			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
+            if (m_atcGateway.m_gatewayStatus == 1)
+                m_atcGateway.RecordDataDequeue(dev, p);
 			if (m_ccMode == 3) { // HPCC or PowerTCP-INT
 				if (!PowerEnabled)
 					ih->PushHop(Simulator::Now().GetTimeStep(), m_txBytes[ifIndex], dev->GetQueue()->GetNBytesTotal(), dev->GetDataRate().GetBitRate());
@@ -1027,7 +1029,7 @@ void SwitchNode::SendBifrostPfcWithCustomTime() {
     // 遍历所有ingress端口和队列
     for (uint32_t inDev = 0; inDev < m_devices.size(); inDev++) {
         Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[inDev]);
-        if (!dev) {
+        if (!dev || !dev->IsLinkUp()) {
             continue;
         }
 
@@ -1089,7 +1091,7 @@ void SwitchNode::ReadBifrostConfigFromFile(const std::string& configFile) {
     
     while (conf >> key) {
         if (key.compare("BIFROST_PFC_PERIOD") == 0) {
-            conf >> pfcPeriod;
+            NS_ABORT_MSG_IF(!(conf >> pfcPeriod) || pfcPeriod == 0, "BIFROST_PFC_PERIOD must be positive");
             break;
         }
         // 跳过行尾
@@ -1176,11 +1178,6 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
     }
     NS_ABORT_MSG_IF(wanPorts == 0 || m_atcConfig.long_haul_bandwidth == 0,
                     "ATC gateway requires a topology-marked WAN link");
-    // Source accounting and the existing rate actuator describe one WAN link.
-    // Destination gateways may receive independently accounted peers on several
-    // WAN ports; their own long-haul rate/threshold are not used for control.
-    NS_ABORT_MSG_IF(gatewayType == 1 && wanPorts != 1,
-                    "ATC source aggregate accounting requires one WAN interface");
     std::cout << "[ATC] Switch " << GetId() << " WAN parameters from port "
               << firstWanPort << ": bandwidth=" << m_atcConfig.long_haul_bandwidth
               << "bps delay=" << m_atcConfig.long_haul_delay.GetNanoSeconds()
@@ -1206,6 +1203,16 @@ void SwitchNode::InitializeAtcGateway(uint32_t gatewayType) {
         m_atcConfig.long_haul_bandwidth,
         m_atcConfig.long_haul_delay
     );
+    if (gatewayType == 1 && wanPorts > 1) {
+        for (uint32_t port = 1; port < GetNDevices(); ++port) {
+            auto device = DynamicCast<QbbNetDevice>(GetDevice(port));
+            if (device && device->IsWanPort()) {
+                auto channel = DynamicCast<QbbChannel>(device->GetChannel());
+                m_atcGateway.ConfigureSourceWanPort(port, device->GetDataRate().GetBitRate(),
+                                                    channel->GetDelay());
+            }
+        }
+    }
     
     std::string gatewayTypeStr;
     if (gatewayType == 1) gatewayTypeStr = "source";

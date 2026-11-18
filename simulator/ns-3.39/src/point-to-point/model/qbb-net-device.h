@@ -242,6 +242,9 @@ protected:
   bool m_qcnEnabled;
   bool m_dynamicth;
   uint32_t m_pausetime;	//< Time for each Pause
+  bool m_sentPfcPause[qCnt]{}; // Ordinary PFC holds until the MMU sends XON.
+  EventId m_bifrostResume[qCnt];
+  void FinishBifrostPause(uint32_t qIndex);
   bool m_paused[qCnt];	//< Whether a queue paused
   bool dummy_paused[qCnt];
 

@@ -95,9 +95,9 @@ GrcHelper::Install(uint32_t ccMode,
                             value != "off",
                         "Invalid boolean: TRACE_EVENTS");
     }
-    std::map<uint32_t, std::map<uint32_t, uint32_t>> routes;
-    std::map<uint32_t, uint32_t> asDestination;
-    std::map<uint32_t, std::map<uint32_t, uint32_t>> ports;
+    std::map<uint32_t, std::map<uint32_t, std::vector<uint32_t>>> routes;
+    std::map<uint32_t, std::set<uint32_t>> asDestinations;
+    std::map<uint32_t, std::map<uint32_t, std::vector<uint32_t>>> ports;
     for (uint32_t id = 0; id < nodes.GetN(); ++id)
     {
         Ptr<Node> node = nodes.Get(id);
@@ -119,8 +119,7 @@ GrcHelper::Install(uint32_t ccMode,
             NS_ABORT_MSG_IF(!DynamicCast<SwitchNode>(node), "GRC switch role assigned to a host");
             if (dciSwitches.count(id))
             {
-                NS_ABORT_MSG_IF(!asDestination.emplace(dc, id).second,
-                                "Require one DCI per AS");
+                asDestinations[dc].insert(id);
             }
         }
         for (uint32_t port = 0; port < node->GetNDevices(); ++port)
@@ -133,51 +132,55 @@ GrcHelper::Install(uint32_t ccMode,
             auto other =
                 channel->GetDevice(0) == dev ? channel->GetDevice(1) : channel->GetDevice(0);
             uint32_t next = other->GetNode()->GetId();
-            NS_ABORT_MSG_IF(ports[id].count(next),
-                            "Parallel links need an explicit routing policy");
-            ports[id][next] = port;
+            ports[id][next].push_back(port);
         }
     }
-    // Find DCI egress link rates for controller initialization; forwarding uses SwitchNode's routing table.
-    for (const auto& [src, neighbors] : ports)
+    // Find all shortest WAN egresses towards any DCI in each destination DC.
+    // Forwarding still uses SwitchNode's ECMP table. The controller's initial
+    // capacity must include every eligible port, including multi-spine DCs.
+    for (const auto& [dc, destinations] : asDestinations)
     {
-        if (!dciSwitches.count(src))
-            continue;
-        std::map<uint32_t, uint32_t> parent{{src, src}};
+        std::map<uint32_t, uint32_t> distance;
         std::queue<uint32_t> q;
-        q.push(src);
+        for (uint32_t dst : destinations)
+        {
+            distance[dst] = 0;
+            q.push(dst);
+        }
         while (!q.empty())
         {
             auto u = q.front();
             q.pop();
             for (const auto& [v, port] : ports[u])
-                if (dciSwitches.count(v) && !parent.count(v))
+                if (dciSwitches.count(v) && nodeToDc.at(u) != nodeToDc.at(v) &&
+                    !distance.count(v))
                 {
-                    parent[v] = u;
+                    distance[v] = distance.at(u) + 1;
                     q.push(v);
                 }
         }
-        for (const auto& [as, dst] : asDestination)
+        for (uint32_t src : dciSwitches)
         {
-            if (src == dst)
+            if (nodeToDc.at(src) == dc)
                 continue;
-            NS_ABORT_MSG_IF(!parent.count(dst), "Disconnected GRC DCI graph");
-            uint32_t next = dst;
-            while (parent.at(next) != src)
-                next = parent.at(next);
-            routes[src][as] = ports.at(src).at(next);
+            NS_ABORT_MSG_IF(!distance.count(src), "Disconnected GRC DCI graph");
+            for (const auto& [next, egresses] : ports.at(src))
+                if (dciSwitches.count(next) && nodeToDc.at(src) != nodeToDc.at(next) &&
+                    distance.count(next) && distance.at(next) + 1 == distance.at(src))
+                    routes[src][dc].insert(routes[src][dc].end(), egresses.begin(), egresses.end());
         }
     }
     for (const auto& [id, dc] : nodeToDc)
     {
-        NS_ABORT_MSG_IF(!asDestination.count(dc), "AS has no DCI attachment");
+        NS_ABORT_MSG_IF(!asDestinations.count(dc), "AS has no DCI attachment");
         for (const auto& [next, port] : ports[id])
             NS_ABORT_MSG_IF(dc != nodeToDc.at(next) &&
                                 !(dciSwitches.count(id) && dciSwitches.count(next)),
                             "Cross-AS links must join DCI switches");
     }
-    for (const auto& [as, root] : asDestination)
+    for (const auto& [as, destinations] : asDestinations)
     {
+        const uint32_t root = *destinations.begin();
         std::set<uint32_t> reached{root};
         std::queue<uint32_t> q;
         q.push(root);
@@ -210,8 +213,9 @@ GrcHelper::Install(uint32_t ccMode,
         resolved << "NODE " << id << ' ' << dc << ' '
                  << (hostToDc.count(id) ? 0 : dciSwitches.count(id) ? 2 : 1) << '\n';
     for (const auto& [id, destinations] : routes)
-        for (const auto& [as, port] : destinations)
-            resolved << "ROUTE " << id << ' ' << as << ' ' << port << '\n';
+        for (const auto& [as, egresses] : destinations)
+            for (uint32_t port : egresses)
+                resolved << "ROUTE " << id << ' ' << as << ' ' << port << '\n';
     GrcSettings::enabled = true;
     for (uint32_t id : dciSwitches)
     {

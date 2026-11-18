@@ -26,12 +26,13 @@ QUERY_FCT_OUTPUT_TEMPLATE examples/CrossDC-Algos/results/fct/query-flow-{suffix}
 # ===== Workload 参数 =====
 CDF_FILE_NAME examples/CrossDC-Algos/config/workload/Alistorage.txt
 LOAD 0
-LOAD_DC1 0
 START_TIME 0
 FLOW_LAUNCH_END_TIME 0.1
-QUERY_REQUEST_RATE 0
-REQUEST_SIZE 0
-INCAST 5
+# 清空 QUERY_FLOW_FILE 时使用以下自动前景流参数
+FILE_FLOW_COUNT 4
+FILE_FLOW_SIZE_BYTES 300000000
+FILE_INCAST 2
+FILE_FLOW_START_TIME 0.005
 QUERY_AUTO_STOP 1
 
 # ===== 混合流量模式 =====
@@ -84,7 +85,7 @@ GATEWAY_SRC 2 21 23
 GATEWAY_DST 1 22
 MAX_ATC_VOQ_COUNT 128
 MAX_ATC_VOQ_RATE 100000000000
-ATC_VOQ_MAX_SIZE 1000000
+ATC_VOQ_MAX_SIZE 4000000
 ATC_CNP_NOTIFY_INTERVAL 50
 ATC_MIN_RATE 100Mb/s
 ATC_RATE_DECREASE_INTERVAL 100
@@ -95,7 +96,7 @@ ATC_VOQ_INFLIGHT_RTT_US 3000
 
 # ================================================================================
 # [DCI-Ext] ccMode=16 v3 - 表驱动跨域拥塞控制（收发双方各建表，无门控）
-# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(20MiB→两个学费CNP→400us静默→查表)
+# 发送方 DCI（节点 21、23）：表A DIP速度表 + 流观察期(10MiB→两个学费CNP→400us静默→查表)
 #                          + ECN 快速反馈（清位+立即CNP）+ 0xFA 消费/查表连发
 # 接收方 DCI（节点 22）：表一/表二聚合 + ACK速率统计 + 周期T 0xFA 反馈
 # ================================================================================
@@ -108,7 +109,7 @@ DCIEXT_DT_US 10
 # RTT 目标区间容差 sigma（us）：区间内取当前配额与 ACK 速率的较大值
 DCIEXT_SIGMA_US 6
 # 新流观察期（MiB，1 MiB = 1,048,576 B）：达到阈值后发两个学费 CNP，再静默 400us
-DCIEXT_OBSERVE_MB 20
+DCIEXT_OBSERVE_MB 10
 DCIEXT_SILENT_US 400
 # 流老化时长 = N 个周期 T（无数据/ACK 即移出表一/表二计数）
 DCIEXT_AGING_PERIODS 4
