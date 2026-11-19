@@ -1066,6 +1066,7 @@ void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q, uint32_t stage) {
 		if (q->mlx.m_targetRate.GetBitRate() > cap)
 			q->mlx.m_targetRate = DataRate((uint64_t)cap);
 	}
+	m_nic[GetNicIdxOfQp(q)].dev->TriggerTransmit();
 }
 
 void RdmaHw::FastRecoveryMlx(Ptr<RdmaQueuePair> q) {

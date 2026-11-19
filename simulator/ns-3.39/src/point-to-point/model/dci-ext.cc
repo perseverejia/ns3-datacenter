@@ -163,22 +163,19 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
 
             DciExtSndDip &e = m_sndDips[dip];
             e.rAvblBps = rAvblBps;
+            e.hasGrant = true;
             Time now = Simulator::Now();
-            double dt = (now - e.lastSettle).GetSeconds();
-            if (e.lastSettle > Seconds(0) && dt > 0)
-                e.sndRateBps = (double)e.sndBytes * 8.0 / dt; // R_snd 结算对齐反馈节拍
-            e.sndBytes = 0;
-            e.lastSettle = now;
+            e.sndRateBps = e.feedbackWindow.Settle(now, e.dataSentBytes);
 
             if (m_debug) {
-                printf("[DCIEXT_FB] %lu node=%u dip=0x%08x rAvbl=%.3fG R_snd=%.3fG sndBytes_reset=%lu\n",
+                printf("[DCIEXT_FB] %lu node=%u dip=0x%08x rAvbl=%.3fG R_snd=%.3fG\n",
                        now.GetTimeStep(), m_nodeId, dip,
-                       e.rAvblBps / 1e9, e.sndRateBps / 1e9, (unsigned long)(e.sndBytes));
+                       e.rAvblBps / 1e9, e.sndRateBps / 1e9);
             }
 
             // 当前配额控制：首个跨域 RTT 前用 P，之后用 0.9P。
             if (e.rAvblBps > 0 && e.sndRateBps > 0) {
-                double vBps = ComputeV(e, m_periodT.GetSeconds());
+                double vBps = ComputeV(e, e.rAvblBps);
                 // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
                 double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
                 if (e.sndRateBps > effBps) {
@@ -273,19 +270,15 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
                     f.observeBytes = 0;
                     f.lastActive = Simulator::Now();
 
-                    // 表A 无此 DIP：初始可用带宽 = 服务器接入带宽 B >> 2（1/4）
-                    // 注：不用长链路线速（100G/4=25G）——R_avbl 语义是"该 DIP 可分得的带宽"，
-                    // 上界由 B 约束；首反馈到达前用保守初值，避免首查表压制不足
+                    // Until the first 0xFA, each new flow may use B/4.
                     auto dit = m_sndDips.find(ch.dip);
                     if (dit == m_sndDips.end()) {
                         DciExtSndDip &e = m_sndDips[ch.dip];
-                        e.rAvblBps = (double)((uint64_t)m_dipBwBps >> 2);
-                        e.sndBytes = 0;
-                        e.sndRateBps = 0;
-                        e.lastSettle = Simulator::Now();
+                        e.feedbackWindow.Reset(Simulator::Now(), e.dataSentBytes);
+                        e.timerWindow.Reset(Simulator::Now(), e.dataSentBytes);
                         if (m_debug) {
-                            printf("[DCIEXT_NEW_DIP] %lu node=%u dip=0x%08x init_rAvbl=%.3fG (dipBw/4)\n",
-                                   Simulator::Now().GetTimeStep(), m_nodeId, ch.dip, e.rAvblBps / 1e9);
+                            printf("[DCIEXT_NEW_DIP] %lu node=%u dip=0x%08x per_flow_start=%.3fG (B/4)\n",
+                                   Simulator::Now().GetTimeStep(), m_nodeId, ch.dip, InitialFlowRateBps() / 1e9);
                         }
                     }
                 }
@@ -408,7 +401,7 @@ bool DciExt::PacketIn(Ptr<NetDevice> device, Ptr<Packet> pkt, CustomHeader &ch) 
 // ---------------------------------------------------------------------------
 // 挂钩点 2：出队（SwitchNotifyDequeue）
 //   发送方 DCI：受管流数据包从长链路端口出队时
-//     表A：sndBytes 累计（R_snd 口径 = 实际出长链路的 payload 字节）
+//     表A：dataSentBytes 累计（R_snd 口径 = 实际出长链路的 payload 字节）
 //     流表：OBSERVE -> 学费 CNP -> SILENT -> CTL
 //   接收方 DCI：受管流数据包从 DC 内端口（非长链路）出队时
 //     流表：winTxBytes 累计（txRate 口径）+ dataArrival[seq] 打点
@@ -490,8 +483,9 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
 
     // 表A 发送字节累计 + Inflight dataSent 累计
     DciExtSndDip &e = m_sndDips[dip];
-    e.sndBytes += payload;
     e.dataSentBytes += payload;
+    if (!e.hasGrant)
+        f.startupBytes += payload;
 
     // qbbHeader: sport(2) dport(2) flags(2) pg(2) seq(4) → seq 在 L4+8 = base+28
     uint32_t seq = ((uint32_t)buf[base + 28] << 24) | ((uint32_t)buf[base + 29] << 16) |
@@ -516,19 +510,23 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
         }
     } else if (f.state == DciExtSndFlow::SILENT && now >= f.silentUntil) {
         // 静默期满：比较当前 R_snd 与表A R_avbl，查表首次压制 → 转入受控
-        double dt = (now - e.lastSettle).GetSeconds();
-        double sndRateNow = (e.lastSettle > Seconds(0) && dt > 0)
-                                ? (double)e.sndBytes * 8.0 / dt : e.sndRateBps;
+        const Time elapsed = now - (f.silentUntil - m_silentUs);
+        const uint64_t bytes = e.hasGrant ? e.dataSentBytes - f.dipBytesAtSilence : f.startupBytes;
+        const double sndRateNow = elapsed.IsStrictlyPositive()
+                                      ? bytes * 8.0 / elapsed.GetSeconds() : 0.0;
         f.state = DciExtSndFlow::CTL;
-        if (sndRateNow > e.rAvblBps && sndRateNow > 0 && f.burstRemaining == 0) {
-            double ratio = e.rAvblBps / sndRateNow;
+        const double target = e.hasGrant ? e.rAvblBps : InitialFlowRateBps();
+        if (sndRateNow > target && target > 0 && f.burstRemaining == 0) {
+            double ratio = target / sndRateNow;
             uint32_t n = LookupN(ratio);
             if (n == 0)
                 n = 1;
             f.burstRemaining = n;
             if (m_debug) {
-                printf("[DCIEXT_CNP] %lu node=%u type=FIRST_CTL n=%u sport=%u ratio=%.3f\n",
-                       now.GetTimeStep(), m_nodeId, n, f.sport, ratio);
+                printf("[DCIEXT_CNP] %lu node=%u type=FIRST_CTL n=%u sport=%u ratio=%.3f R_snd=%.3fG P=%.3fG bytes=%lu dt_ns=%ld scope=%s\n",
+                       now.GetTimeStep(), m_nodeId, n, f.sport, ratio, sndRateNow / 1e9,
+                       target / 1e9, (unsigned long)bytes, (long)elapsed.GetNanoSeconds(),
+                       e.hasGrant ? "dip" : "flow");
             }
             BurstTick(key);
         }
@@ -541,52 +539,38 @@ void DciExt::NotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
 }
 
 // 沿用原配额调整、反馈触发、周期控制及 burst 后重新测量。
-double DciExt::ComputeV(DciExtSndDip &e, double tSec) {
+double DciExt::ComputeV(const DciExtSndDip &e, double quotaBps) {
     if (e.rttCrossMaxUs <= 0)
-        return e.rAvblBps;
-    return e.rAvblBps * 0.9;
+        return quotaBps;
+    return quotaBps * 0.9;
 }
 
 void DciExt::SndTick() {
     if (!m_senderSide)
         return;
     Time now = Simulator::Now();
-    for (auto &kv : m_sndDips) {
-        DciExtSndDip &e = kv.second;
-        double dt = (now - e.lastSettle).GetSeconds();
-        if (e.lastSettle > Seconds(0) && dt > 0)
-            e.sndRateBps = (double)e.sndBytes * 8.0 / dt;
-        e.sndBytes = 0;
-        e.lastSettle = now;
-
-        if (e.rAvblBps > 0 && e.sndRateBps > 0) {
-            // 与 0xFA OVERLOAD 同式：调整后的配额与 R_snd 驱动固定表查找。
-            double vBps = ComputeV(e, m_periodT.GetSeconds());
-            // v > P 用 v；v < P 时取 max(v, 0.9P)：压制带宽下限贴 P 的九折，让跨域流速贴近均分线
-            double effBps = (vBps > e.rAvblBps) ? vBps : std::max(vBps, 0.9 * e.rAvblBps);
-            if (e.sndRateBps > effBps) {
-                double ratio = effBps / e.sndRateBps;
-                for (auto &fkv : m_sndFlows) {
-                    DciExtSndFlow &f = fkv.second;
-                    if (f.dip != kv.first || f.state != DciExtSndFlow::CTL)
-                        continue;
-                    if (f.burstRemaining > 0)
-                        continue;
-                    uint32_t n = LookupN(ratio);
-                    if (n == 0)
-                        n = 1;
-                    if (m_debug) {
-                        printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
-                               "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f\n",
-                               now.GetTimeStep(), m_nodeId, n, kv.first,
-                               e.sndRateBps / 1e9, e.rAvblBps / 1e9, vBps / 1e9,
-                               (double)(e.dataSentBytes - e.ackedBytes) / 1048576.0,
-                               e.rttCrossMaxUs, ratio);
-                    }
-                    f.burstRemaining = n;
-                    BurstTick(fkv.first);
-                }
+    for (auto& [dip, e] : m_sndDips) {
+        e.sndRateBps = e.timerWindow.Settle(now, e.dataSentBytes);
+        const double quota = e.hasGrant ? e.rAvblBps : InitialFlowRateBps();
+        const double target = ComputeV(e, quota);
+        for (auto& [key, f] : m_sndFlows) {
+            if (f.dip != dip || f.state != DciExtSndFlow::CTL || f.burstRemaining > 0)
+                continue;
+            const double measured = e.hasGrant ? e.sndRateBps
+                                               : f.startupWindow.Settle(now, f.startupBytes);
+            if (target <= 0 || measured <= target)
+                continue;
+            const double ratio = target / measured;
+            f.burstRemaining = LookupN(ratio);
+            if (m_debug) {
+                printf("[DCIEXT_CNP] %lu node=%u type=HOLD n=%u dip=0x%08x "
+                       "R_snd=%.3fG P=%.3fG v=%.3fG infl=%.1fMB rttX=%.1fus ratio=%.3f "
+                       "sport=%u scope=%s\n",
+                       now.GetTimeStep(), m_nodeId, f.burstRemaining, dip, measured / 1e9,
+                       quota / 1e9, target / 1e9, (e.dataSentBytes - e.ackedBytes) / 1048576.0,
+                       e.rttCrossMaxUs, ratio, f.sport, e.hasGrant ? "dip" : "flow");
             }
+            BurstTick(key);
         }
     }
     m_sndTickEvent = Simulator::Schedule(m_periodT, &DciExt::SndTick, this);
@@ -901,15 +885,18 @@ void DciExt::BurstTick(DciExtFlowKey key) {
         f.burstEvent = Simulator::Schedule(m_burstInterval, &DciExt::BurstTick, this, key);
     else {
         // burst 结束：学费 burst → 转静默；重置 DIP 结算基准
+        auto& dip = m_sndDips.at(f.dip);
+        const Time now = Simulator::Now();
         if (f.state == DciExtSndFlow::INIT_CNP) {
             f.state = DciExtSndFlow::SILENT;
-            f.silentUntil = Simulator::Now() + m_silentUs;
+            f.silentUntil = now + m_silentUs;
+            f.dipBytesAtSilence = dip.dataSentBytes;
+            f.startupBytes = 0;
         }
-        auto dit = m_sndDips.find(f.dip);
-        if (dit != m_sndDips.end()) {
-            dit->second.sndBytes = 0;
-            dit->second.lastSettle = Simulator::Now();
-        }
+        if (!dip.hasGrant)
+            f.startupWindow.Reset(now, f.startupBytes);
+        dip.feedbackWindow.Reset(now, dip.dataSentBytes);
+        dip.timerWindow.Reset(now, dip.dataSentBytes);
     }
 }
 

@@ -96,6 +96,9 @@ bool ThemisGateway::IsDestination(const ThemisFlowKey& key) const {
 bool ThemisGateway::IsLoopPort(uint32_t port) const {
     return port == m_loopTx || port == m_loopRx;
 }
+uint64_t ThemisGateway::GetLoopQueueBytes() const {
+    return DynamicCast<QbbNetDevice>(m_node->GetDevice(m_loopTx))->GetQueue()->GetNBytesTotal();
+}
 bool ThemisGateway::IsWan(uint32_t port) const {
     auto dev = DynamicCast<QbbNetDevice>(m_node->GetDevice(port));
     return dev && dev->IsWanPort();

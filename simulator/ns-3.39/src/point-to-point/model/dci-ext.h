@@ -68,6 +68,19 @@ struct DciExtRcvDip {
     DciExtRcvDip() : rAvblBps(0), hasRAvbl(false), rttBaseUs(1e18), hasRttBase(false) {}
 };
 
+// A feedback arrival and a sender timer each measure their own interval.
+struct DciExtRateWindow {
+    Time start;
+    uint64_t startBytes = 0;
+    void Reset(Time now, uint64_t total) { start = now; startBytes = total; }
+    double Settle(Time now, uint64_t total) {
+        const Time elapsed = now - start;
+        const uint64_t bytes = total - startBytes;
+        Reset(now, total);
+        return elapsed.IsStrictlyPositive() ? bytes * 8.0 / elapsed.GetSeconds() : 0.0;
+    }
+};
+
 // 发送方流表项：观察期状态机
 struct DciExtSndFlow {
     uint32_t sip, dip;
@@ -77,6 +90,9 @@ struct DciExtSndFlow {
     State state;             // 观察 -> 学费 CNP -> 静默 -> T周期控制
     uint64_t observeBytes;   // 观察期累计发送字节（payload 口径）
     Time silentUntil;
+    uint64_t startupBytes = 0; // this flow's WAN payload since entering silence
+    DciExtRateWindow startupWindow;
+    uint64_t dipBytesAtSilence = 0; // aggregate WAN payload at this flow's silence boundary
     uint32_t burstRemaining; // 本轮待连发 CNP 个数
     EventId burstEvent;
     Time lastActive;
@@ -93,15 +109,15 @@ struct DciExtSndFlow {
 
 // 发送方 表A：DIP 速度表【DIP, R_avbl, R_snd, Inflight, RTT_cross】
 struct DciExtSndDip {
-    double rAvblBps;      // 可用带宽 P（0xFA 更新；初始 = DIP 带宽 B/4）
-    uint64_t sndBytes;    // 出长链路字节累计（payload 口径，R_snd 结算源）
+    bool hasGrant = false; // 0xFA carries an aggregate quota for this destination
+    double rAvblBps;      // aggregate quota received in 0xFA (bps)
     double sndRateBps;    // R_snd：最近一次实际测量窗口的发送速率
-    Time lastSettle;      // 上次结算时刻
+    DciExtRateWindow feedbackWindow, timerWindow;
     uint64_t dataSentBytes; // 已出长链路数据字节累计（Inflight = dataSent - acked）
     uint64_t ackedBytes;    // 回程 ACK 已确认字节累计（水位差分）
     double rttCrossMaxUs;   // 跨域 RTT 运行最大值（us，无样本时为 0）
 
-    DciExtSndDip() : rAvblBps(0), sndBytes(0), sndRateBps(0), lastSettle(Seconds(0)),
+    DciExtSndDip() : rAvblBps(0), sndRateBps(0),
                      dataSentBytes(0), ackedBytes(0), rttCrossMaxUs(0) {}
 };
 
@@ -140,7 +156,8 @@ public:
                           uint32_t wanPort = 0); // 0xFA 反馈
     void BurstTick(DciExtFlowKey key);              // 连发定时器回调
     uint32_t LookupN(double ratio) const;
-    double ComputeV(DciExtSndDip &e, double tSec);  // 原配额调整：首个跨域 RTT 前为 P，之后为 0.9P
+    double InitialFlowRateBps() const { return m_dipBwBps / 4.0; }
+    double ComputeV(const DciExtSndDip &e, double quotaBps);  // 原配额调整：首个跨域 RTT 前为 P，之后为 0.9P
 
     bool m_debug;                 // 日志开关
     uint32_t m_nodeId;            // 宿主节点 ID（日志用）

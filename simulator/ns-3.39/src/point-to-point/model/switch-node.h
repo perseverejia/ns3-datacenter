@@ -141,6 +141,7 @@ public:
 	Ptr<ThemisGateway> InitializeThemis(uint32_t dc,
 	                                  const std::map<uint32_t, uint32_t>& hostIpToDc,
 	                                  const ThemisSettings& settings);
+	Ptr<const ThemisGateway> GetThemisGateway() const { return m_themis; }
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();

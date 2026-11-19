@@ -67,6 +67,10 @@ class ThemisGateway : public Object {
     bool PacketIn(uint32_t ingress, Ptr<Packet> p, CustomHeader& ch);
     void NotifyDequeue(uint32_t outPort, Ptr<Packet> p);
     bool IsLoopPort(uint32_t port) const;
+    uint64_t GetLoopQueueBytes() const;
+    // Admission-to-release occupancy includes packets on the internal link.
+    uint64_t GetLoopDataBytes() const { return m_dataBytes; }
+    uint64_t GetLoopDummyBytes() const { return m_dummyBytes; }
 
   private:
     void DoDispose() override;
