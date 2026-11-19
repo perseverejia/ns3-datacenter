@@ -106,11 +106,11 @@ def rates(run, src):
     return samples[:, 0] / NS_PER_MS, gbps
 
 
-def layout(rows, height, names):
+def layout(rows, height, names, title_pad=6):
     fig, axes = plt.subplots(rows, len(names), figsize=(13.2, height), squeeze=False,
                              sharex="col", sharey="row")
     for col, name in enumerate(names):
-        axes[0, col].set_title(name, fontweight="semibold", pad=6)
+        axes[0, col].set_title(name, fontweight="semibold", pad=title_pad)
         for ax in axes[:, col]:
             ax.set_axisbelow(True)
             ax.grid(axis="y", color="#DBDFE1", linewidth=0.55)
@@ -132,11 +132,11 @@ def mark_short_start(ax, join_ms):
         return
     return ax.axvline(join_ms, ymax=0.985, color="#98445F", lw=1.0, ls="--",
                       marker="v", markevery=[1], markersize=3.6, markeredgewidth=0,
-                      label=f"Short flow starts at {join_ms:.3f} ms")
+                      label="Short flow starts")
 
 
 def draw_queues(runs, output, suffix=""):
-    fig, axes = layout(2, 4.1, runs)
+    fig, axes = layout(2, 4.1, runs, title_pad=19)
     for col, run in enumerate(runs.values()):
         for row, (field, color) in enumerate((("dci_queued_bytes", "#205772"),
                                               ("leaf_8_to_4_bytes", "#4A7750"))):
@@ -144,22 +144,20 @@ def draw_queues(runs, output, suffix=""):
             ax.plot(run.queues["time_ns"]/NS_PER_MS, run.queues[field]/1e6, color=color, lw=1.0)
             peak = run.queues[field].max()
             peak_label = f"{peak / 1e6:.2f} MB" if peak >= 100_000 else f"{peak / 1e3:.2f} kB"
-            ax.text(0.035, 0.92, f"Peak {peak_label}", transform=ax.transAxes,
-                    ha="left", va="top", fontsize=8, color="#35434B")
+            ax.text(0.035, 1.025, f"Peak {peak_label}", transform=ax.transAxes,
+                    ha="left", va="bottom", fontsize=8, color="#35434B")
             ax.set_xlim(0, 10)
-            marker = mark_short_start(ax, run.join_ms)
+            mark_short_start(ax, run.join_ms)
             ax.set_xticks([0, 2, 4, 6, 8, 10])
     for row, label in enumerate(("DCI queue (MB)", "Leaf queue (MB)")):
         axes[row, 0].set_ylabel(label)
         axes[row, 0].set_ylim(bottom=-0.025 * axes[row, 0].get_ylim()[1])
         axes[row, 0].yaxis.set_major_locator(MaxNLocator(nbins=4))
-    if marker is not None:
-        fig.legend([marker], [marker.get_label()],
-                   loc="upper right", frameon=False, bbox_to_anchor=(0.48, 1))
-    fig.text(0.51 if marker is not None else 0.5, 0.968, "DCI includes the ATC VOQ and Themis loop FIFO",
-             va="center", ha="left" if marker is not None else "center", fontsize=9)
-    fig.supxlabel("Time from long-haul flow start (ms)", y=0.025)
-    fig.subplots_adjust(left=0.064, right=0.987, bottom=0.165, top=0.835, hspace=0.22, wspace=0.15)
+    first = axes[0, 0]
+    if first.get_legend_handles_labels()[0]:
+        first.legend(loc="lower right", bbox_to_anchor=(1, 1.025), borderpad=0, borderaxespad=0,
+                     fontsize=8, handlelength=1.4, frameon=False)
+    fig.subplots_adjust(left=0.064, right=0.987, bottom=0.08, top=0.88, hspace=0.25, wspace=0.15)
     save(fig, output, f"startup-queues{suffix}")
 
 
@@ -189,11 +187,10 @@ def draw_rates(runs, output, tx, flows, suffix=""):
         axes[0, 0].set_ylabel("RX goodput (Gb/s)")
         handles, labels = axes[0, 0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
-    fig.supxlabel("Time from long-haul flow start (ms)", y=0.025)
     top = 0.92 if tx else 0.76
     if tx and marker is not None:
         top = 0.86
-    fig.subplots_adjust(left=0.068, right=0.987, bottom=0.135 if tx else 0.225,
+    fig.subplots_adjust(left=0.068, right=0.987, bottom=0.07 if tx else 0.12,
                         top=top, hspace=0.22, wspace=0.17)
     name = "tx-rate" if tx else "rx-rate"
     save(fig, output, name + suffix)
@@ -228,7 +225,7 @@ def draw_grc_reference(run, directory, output, suffix=""):
     padding = max(0.05, (max(bounds) - min(bounds)) * 0.1)
     full.set_ylim(max(0, min(bounds) - padding), max(bounds) + padding)
     for ax, end, title in [(full, end_ms, "Full run"), (zoom, min(35., end_ms), "Startup detail")]:
-        ax.set(xlim=(0, end), title=title, xlabel="Time (ms)")
+        ax.set(xlim=(0, end), title=title)
         mark_short_start(ax, run.join_ms)
         ax.spines[["top", "right"]].set_visible(False)
         ax.grid(axis="y", color="#DBDFE1", linewidth=0.6)
@@ -236,7 +233,7 @@ def draw_grc_reference(run, directory, output, suffix=""):
     full.set_ylabel("GRC reference rate (Gb/s)")
     handles, labels = full.get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
-    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.155, top=0.81, wspace=0.12)
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.09, top=0.81, wspace=0.12)
     save(fig, output, f"grc-ref-rate{suffix}")
 
 
